@@ -4,3 +4,5 @@
 !selector.py
 !test_observer.py
 !sitecustomize.py
+!receiver_probes.py
+!comparison_probe.py

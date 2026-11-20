@@ -2,6 +2,7 @@ IMAGE ?= blast-radius-entry
 SAMPLE := $(CURDIR)/sample
 OUTPUT := $(CURDIR)/output.jsonl
 VERIFY_DIR := $(CURDIR)/.verification
+VERIFY_SUITE ?= synthetic
 
 # The flags the scorer runs your image with. The scorer is linux/amd64, so on
 # an Apple Silicon Mac --platform makes your local run match it.
@@ -36,5 +37,5 @@ synthetic: build
 	docker run $(RUN_FLAGS) \
 		--volume "$(VERIFY_DIR):/verification" \
 		--volume "$(CURDIR)/verify_synthetic.py:/verify_synthetic.py:ro" \
-		$(IMAGE) python /verify_synthetic.py
-	$(MAKE) sample SAMPLE="$(VERIFY_DIR)/synthetic" OUTPUT="$(VERIFY_DIR)/synthetic.jsonl"
+		$(IMAGE) python /verify_synthetic.py $(if $(filter scope,$(VERIFY_SUITE)),--scope)
+	$(MAKE) sample SAMPLE="$(VERIFY_DIR)/$(VERIFY_SUITE)" OUTPUT="$(VERIFY_DIR)/$(VERIFY_SUITE).jsonl"

@@ -12,8 +12,11 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
+from functools import cache
 from pathlib import Path, PurePosixPath
 from types import CodeType
+
+from comparison_probe import identity_site
 
 DATA = Path("/data")
 APP = Path(__file__).resolve().parent
@@ -128,6 +131,75 @@ def external_code(code):
     return result
 
 
+def statement_lines(path, original, modified, removed, inserted):
+    """Use line coverage when the patch changes one existing statement header."""
+    if removed != inserted or not removed:
+        return ()
+    old_tree = ast.parse(original, filename=path)
+    new_tree = ast.parse(modified, filename=path)
+
+    def replace_header(tree):
+        choices = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (
+                ast.Assert, ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Expr,
+                ast.If, ast.Return, ast.Raise, ast.While, ast.For,
+            )):
+                continue
+            body = [child.lineno for child in ast.iter_child_nodes(node) if isinstance(child, ast.stmt)]
+            end = min(body) - 1 if body else node.end_lineno
+            if node.lineno <= min(removed) <= max(removed) <= end:
+                choices.append((node.lineno, end, node))
+        if not choices:
+            return (), None
+        start, end, node = min(choices, key=lambda item: item[1] - item[0])
+        # Keep suites intact so changed indentation or an else branch widens.
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, ast.expr):
+                setattr(node, field, ast.Constant(None))
+        return tuple(range(start, end + 1)), type(node)
+
+    old_lines, old_type = replace_header(old_tree)
+    new_lines, new_type = replace_header(new_tree)
+    if old_lines == new_lines and old_type == new_type and ast.dump(old_tree) == ast.dump(new_tree):
+        return old_lines
+    return ()
+
+
+def safe_identity_edit(path, source, updated, mapping):
+    """Prove the observed pure comparisons agree with identity at every changed site."""
+    old = ast.parse(source)
+    new = ast.parse(updated)
+    new_comparisons = {
+        (node.lineno, node.col_offset): node
+        for node in ast.walk(new) if isinstance(node, ast.Compare)
+    }
+    changed = False
+    for node in ast.walk(old):
+        if not identity_site(node):
+            continue
+        counterpart = new_comparisons.get((node.lineno, node.col_offset))
+        if counterpart is None or not isinstance(
+            counterpart.ops[0], ast.Eq if isinstance(node.ops[0], ast.Is) else ast.NotEq,
+        ):
+            continue
+        key = f"identity/{path}:{node.lineno}:{node.col_offset}"
+        if key not in mapping["identity_only"]:
+            return False
+        node.ops[0] = counterpart.ops[0]
+        changed = True
+    return changed and ast.dump(old) == ast.dump(new)
+
+
+def observed_on(mapping, keys):
+    owners = mapping["owners"]
+    return {
+        owners[number]
+        for key in keys
+        for number in mapping["coverage"].get(key, ())
+    }
+
+
 def changed_functions(path, edit):
     original, modified, removed, inserted = edit
     before = FunctionBodies(original)
@@ -154,28 +226,194 @@ def changed_functions(path, edit):
     return affected if affected and not (removed or inserted) else None
 
 
+def attribute_name(statement):
+    if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+        target = statement.targets[0]
+    elif isinstance(statement, ast.AnnAssign):
+        target = statement.target
+    else:
+        return None
+    return target.id if isinstance(target, ast.Name) and statement.value is not None else None
+
+
+@cache
+def module_syntax(path):
+    return ast.parse((BASE / path).read_bytes(), filename=path)
+
+
+def closure_factory(name, tree):
+    """Resolve an undecorated factory that only creates and returns a closure."""
+    for definition in tree.body:
+        if isinstance(definition, ast.ImportFrom) and definition.level == 0:
+            imported = next(
+                (alias.name for alias in definition.names if (alias.asname or alias.name) == name),
+                None,
+            )
+            if imported and definition.module.startswith("sqlglot."):
+                path = definition.module.replace(".", "/") + ".py"
+                if (BASE / path).is_file():
+                    return creates_closure(imported, module_syntax(path))
+        elif isinstance(definition, ast.FunctionDef) and definition.name == name:
+            return creates_closure(name, tree)
+    return False
+
+
+def creates_closure(name, tree):
+    has_future = any(
+        isinstance(node, ast.ImportFrom) and node.module == "__future__"
+        and any(alias.name == "annotations" for alias in node.names)
+        for node in tree.body
+    )
+    if not has_future:
+        return False
+    for function in tree.body:
+        if not isinstance(function, ast.FunctionDef) or function.name != name:
+            continue
+        if function.decorator_list or len(function.body) != 2:
+            return False
+        kept, result = function.body
+        return (
+            isinstance(kept, ast.FunctionDef) and not kept.decorator_list
+            and not kept.args.defaults and not any(kept.args.kw_defaults)
+            and isinstance(result, ast.Return) and isinstance(result.value, ast.Name)
+            and result.value.id == kept.name
+        )
+    return False
+
+
+def same_value_shape(old, new, tree):
+    """Allow value-only changes while preserving keys, types, and call binding."""
+    if ast.dump(old) == ast.dump(new):
+        return True
+    if type(old) is not type(new):
+        return False
+    if isinstance(old, ast.Constant):
+        return type(old.value) is type(new.value)
+    if isinstance(old, ast.UnaryOp):
+        return type(old.op) is type(new.op) and same_value_shape(old.operand, new.operand, tree)
+    if isinstance(old, (ast.Tuple, ast.List)):
+        return len(old.elts) == len(new.elts) and all(
+            same_value_shape(left, right, tree) for left, right in zip(old.elts, new.elts)
+        )
+    if isinstance(old, ast.Dict):
+        return (
+            [ast.dump(key) if key else None for key in old.keys]
+            == [ast.dump(key) if key else None for key in new.keys]
+            and all(same_value_shape(left, right, tree) for left, right in zip(old.values, new.values))
+        )
+    if isinstance(old, ast.Call):
+        return (
+            isinstance(old.func, ast.Name) and ast.dump(old.func) == ast.dump(new.func)
+            and closure_factory(old.func.id, tree)
+            and len(old.args) == len(new.args)
+            and [kw.arg for kw in old.keywords] == [kw.arg for kw in new.keywords]
+            and all(same_value_shape(a, b, tree) for a, b in zip(old.args, new.args))
+            and all(same_value_shape(a.value, b.value, tree)
+                    for a, b in zip(old.keywords, new.keywords))
+        )
+    return False
+
+
+def class_changes(path, source, updated):
+    parts = path.split("/")
+    if len(parts) != 3 or parts[1] not in {"dialects", "parsers", "generators", "expressions"}:
+        return ()
+    old = ast.parse(source)
+    new = ast.parse(updated)
+    changed = []
+
+    def compare_classes(left, right, enclosing=""):
+        for a, b in zip(left.body, right.body):
+            if isinstance(a, ast.ClassDef) and isinstance(b, ast.ClassDef) and a.name == b.name:
+                compare_classes(a, b, f"{enclosing}.{a.name}" if enclosing else a.name)
+            elif enclosing and (attribute := attribute_name(a)) and attribute == attribute_name(b):
+                if ast.dump(a.value) != ast.dump(b.value) and same_value_shape(a.value, b.value, old):
+                    a.value = b.value
+                    changed.append((enclosing, attribute))
+
+    compare_classes(old, new)
+    if changed and ast.dump(old) == ast.dump(new):
+        return changed
+    return ()
+
+
+def references_class(by_file, names):
+    """Cover direct test references, including tests that only inspect a class."""
+    results = set()
+    for filename, ids in by_file.items():
+        raw = (BASE / filename).read_bytes()
+        if not any(name.encode() in raw for name in names):
+            continue
+        tree = module_syntax(filename)
+        pending = [(tree, None)]
+        while pending:
+            node, owner = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+                owner = node.name
+            if (
+                isinstance(node, ast.Name) and node.id in names
+                or isinstance(node, ast.Attribute) and node.attr in names
+                or isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in names
+            ):
+                results.update(
+                    nodeid for nodeid in ids
+                    if owner is None or nodeid.rsplit("::", 1)[-1].split("[", 1)[0] == owner
+                )
+            pending.extend((child, owner) for child in ast.iter_child_nodes(node))
+    return results
+
+
+def class_candidates(path, source, updated, mapping, by_file):
+    changes = class_changes(path, source, updated)
+    if not changes:
+        return None
+    compile(updated, path, "exec")
+    module = path.removesuffix(".py").replace("/", ".")
+    candidates = set()
+    for name, attribute in changes:
+        outer = name.split(".")[0]
+        roots = observed_on(mapping, {f"receiver/{module}:{name}", f"receiver/{module}:{outer}"})
+        if not roots - {COLLECTION}:
+            return None
+        candidates.update(roots - {COLLECTION})
+        candidates.update(references_class(by_file, {outer, attribute}))
+    return candidates
+
+
 def candidate_tests(edits, mapping, by_file, all_ids):
     selected = set(mapping["failed"])
+    class_modules = []
     for path, edit in edits.items():
         if path.startswith("tests/fixtures/") and path in mapping["fixtures"]:
             for owner in mapping["fixtures"][path]:
                 if owner == COLLECTION:
-                    return all_ids
+                    return all_ids, ()
                 selected.update(by_file.get(owner, (owner,)))
         elif path.startswith("sqlglot/") and path.endswith(".py"):
-            keys = changed_functions(path, edit)
-            if keys is None:
-                return all_ids
-            owners = set(mapping.get("source_reads", {}).get(path, ()))
-            for key in keys:
-                owners.update(mapping["coverage"].get(key, ()))
+            source, updated, removed, inserted = edit
+            owners = set(mapping["source_reads"].get(path, ()))
+            if ast.dump(ast.parse(source)) != ast.dump(ast.parse(updated)):
+                keys = changed_functions(path, edit)
+                if keys is None:
+                    class_owners = class_candidates(path, source, updated, mapping, by_file)
+                    if class_owners is None:
+                        return all_ids, ()
+                    owners.update(class_owners)
+                    class_modules.append(path.removesuffix(".py").replace("/", "."))
+                elif not safe_identity_edit(path, source, updated, mapping):
+                    reached = observed_on(mapping, keys)
+                    lines = statement_lines(path, source, updated, removed, inserted)
+                    line_owners = observed_on(mapping, (f"{path}#{line}" for line in lines))
+                    owners.update(line_owners or reached)
+            else:
+                compile(updated, path, "exec")
             if COLLECTION in owners:
-                return all_ids
+                return all_ids, ()
             for owner in owners:
                 selected.update(by_file.get(owner, (owner,)))
         else:
-            return all_ids
-    return selected & all_ids
+            return all_ids, ()
+    return selected & all_ids, class_modules
 
 
 def schedule(ids, tests):
@@ -198,17 +436,48 @@ def schedule(ids, tests):
     return best_workers, best_cost
 
 
+
+def patched_tree(scratch, edits):
+    tree = scratch / "source"
+    shutil.copytree(BASE, tree, copy_function=os.symlink)
+    for path, (_, content, _, _) in edits.items():
+        target = tree / path
+        target.unlink()
+        target.write_bytes(content)
+    return tree
+
+
+def run_in_tree(command, tree, env, timeout):
+    with subprocess.Popen(
+        command, cwd=tree, env=env, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    ) as run:
+        try:
+            return run.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(run.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            raise
+
+
+def imports_cleanly(edits, modules, timeout):
+    """Detect import-time failures introduced by narrower class changes."""
+    with tempfile.TemporaryDirectory(prefix="blast-") as scratch:
+        tree = patched_tree(Path(scratch), edits)
+        command = [
+            sys.executable, "-c",
+            "import importlib, sys; [importlib.import_module(name) for name in sys.argv[1:]]",
+            *modules,
+        ]
+        return run_in_tree(command, tree, dict(os.environ, PYTHONPATH=str(tree)), timeout) == 0
+
 def confirm(edits, candidates, all_ids, by_file, timeout):
     """Return observed failures only when pytest completed the requested run."""
     with tempfile.TemporaryDirectory(prefix="blast-") as scratch:
         scratch = Path(scratch)
-        tree = scratch / "source"
-        # Keep unchanged files on the read-only layer and break links for edits.
-        shutil.copytree(BASE, tree, copy_function=os.symlink)
-        for path, (_, content, _, _) in edits.items():
-            target = tree / path
-            target.unlink()
-            target.write_bytes(content)
+        tree = patched_tree(scratch, edits)
         result = scratch / "result.json"
         selection = scratch / "selected.json"
         selection.write_text(json.dumps(sorted(candidates)))
@@ -220,18 +489,7 @@ def confirm(edits, candidates, all_ids, by_file, timeout):
             sys.executable, "-m", "pytest", "-q", "--tb=no", "-p", "no:cacheprovider",
             "-p", "test_observer", "--continue-on-collection-errors", "tests",
         ]
-        with subprocess.Popen(
-            command, cwd=tree, env=env, stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-        ) as run:
-            try:
-                exit_code = run.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(run.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                raise
+        exit_code = run_in_tree(command, tree, env, timeout)
         if exit_code not in (0, 1, 5) or not result.is_file():
             return candidates
         data = json.loads(result.read_text())
@@ -262,9 +520,13 @@ def main():
         if healthy:
             try:
                 edits = apply_patch(patch, BASE)
-                candidates = candidate_tests(edits, mapping, by_file, all_ids)
+                candidates, class_modules = candidate_tests(edits, mapping, by_file, all_ids)
+                if class_modules:
+                    timeout = min(4, deadline - time.monotonic())
+                    if timeout <= 0 or not imports_cleanly(edits, class_modules, timeout):
+                        candidates = all_ids
                 workers, cost = schedule(candidates, tests)
-            except (OSError, ValueError, SyntaxError, RecursionError):
+            except (OSError, ValueError, SyntaxError, RecursionError, subprocess.TimeoutExpired):
                 candidates = all_ids
                 edits = None
             if confirm_candidates and edits and 1 < len(candidates) < len(all_ids):

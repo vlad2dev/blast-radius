@@ -82,6 +82,40 @@ can miss interactions through state shared across tests or native code. The next
 experiment would add coverage inside heavily used functions and validate that
 narrowing on independent mutations.
 
+## Target 150 experiment
+
+This experiment starts from the branch that scored 457.229 simulated seconds
+on the fixed 30-patch sample. It adds line events for replacements inside an
+existing statement header and tracks the concrete classes, plus their base
+classes, seen by the pinned test suite. Spawned workers carry the submitting
+test's identity through argument decoding, execution, and result encoding.
+
+An unchanged Python syntax tree still keeps tests that directly read the
+changed file. Changes to the values of supported class attributes use
+observed receivers and direct test references if the assignment keeps its
+shape and the modified module imports successfully. For identity comparisons,
+the build records whether every observed pair uses proven comparison semantics
+that agree with identity. The table holds source locations and aggregate
+observations. Unknown operands retain the execution-based selection.
+
+The stop condition is three scorer-constrained sample runs with zero misses
+and an estimated local median below 150 seconds, plus zero misses in
+independent full-suite labels. Run `make synthetic VERIFY_SUITE=scope` to
+reproduce the class attribute, parser dispatch, and comparison verification
+cases.
+
+The experiment reached 129.410 simulated seconds with zero misses in each
+of three scorer-constrained sample runs. Output was identical across runs.
+Median container CPU was 3.315 seconds and median Docker wall time was 4.003
+seconds, for an estimated local score of 132.7. The instrumented build passed
+1,620 tests with one skip. The scorer reported zero misses across nine
+independently labeled synthetic patches, including failing dialect settings,
+parser dispatch, and nested tokenizer cases.
+
+The sample and synthetic labels verify the local result. Receiver tracking
+can still miss class values propagated through unrelated global state or
+native code. The public board uses its own patches and runner.
+
 ## Submit
 
 Push to a public GitHub repository with the `Dockerfile` at its top, then enter the repository and the commit hash on the track page. The final scores the commit you pick. If you pick none, your best practice submission counts.

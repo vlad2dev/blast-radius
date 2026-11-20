@@ -5,22 +5,44 @@ import json
 import os
 import sys
 from collections import defaultdict
+from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 
 owner = os.environ.get("BLAST_ACTIVE_TEST")
 if owner:
+    from comparison_probe import install
+    from receiver_probes import RECEIVER_METHODS, receivers
+
     root = os.environ["BLAST_SOURCE"]
     prefix = root + "/sqlglot/"
     fixture_prefix = root + "/tests/fixtures/"
     target = Path(os.environ["BLAST_CHILD_REPORTS"]) / f"{os.getpid()}.json"
     entered = defaultdict(set)
     opened = defaultdict(set)
+    ran_job = False
+    receiver_codes = {}
+    identity_sites = set()
     monitor = sys.monitoring
     tool = monitor.COVERAGE_ID
 
     def on_enter(code, offset):
         if code.co_filename.startswith(prefix):
-            entered[owner].add(f"{code.co_filename[len(root) + 1:]}:{code.co_firstlineno}")
+            path = code.co_filename[len(root) + 1:]
+            probe = receiver_codes.get(code)
+            if probe is None:
+                probe = (path, code.co_qualname) in RECEIVER_METHODS
+                receiver_codes[code] = probe
+                monitor.set_local_events(tool, code, monitor.events.LINE)
+            keys = entered[owner]
+            keys.add(f"{path}:{code.co_firstlineno}")
+            if probe:
+                for receiver in receivers(type(sys._getframe(1).f_locals["self"])):
+                    keys.add(f"receiver/{receiver}")
+                return None
+        return monitor.DISABLE
+
+    def on_line(code, lineno):
+        entered[owner].add(f"{code.co_filename[len(root) + 1:]}#{lineno}")
         return monitor.DISABLE
 
     def on_open(event, args):
@@ -35,28 +57,27 @@ if owner:
             (key, sorted(entered.get(key, ())), sorted(opened.get(key, ())))
             for key in entered.keys() | opened.keys()
         ]
-        target.write_text(json.dumps(data))
+        target.write_text(json.dumps((sorted(identity_sites), data)))
 
+    install(Path(root), identity_sites.add)
     monitor.use_tool_id(tool, "blast-radius child reachability")
     monitor.register_callback(tool, monitor.events.PY_START, on_enter)
     monitor.register_callback(tool, monitor.events.PY_RESUME, on_enter)
+    monitor.register_callback(tool, monitor.events.LINE, on_line)
     monitor.set_events(tool, monitor.events.PY_START | monitor.events.PY_RESUME)
     sys.addaudithook(on_open)
 
 
-def run_pool_task(test, func, args, kwargs):
+def run_pool_task(test, payload):
     """Attribute every job to its submitter even when pytest reuses a pool."""
-    global owner
-    start = owner
-    if owner != "@collection":
+    global owner, ran_job
+    if not ran_job:
         entered["@collection"].update(entered.pop(owner, ()))
         opened["@collection"].update(opened.pop(owner, ()))
+    ran_job = True
     owner = test
     os.environ["BLAST_ACTIVE_TEST"] = test
     monitor.restart_events()
-    try:
-        return func(*args, **kwargs)
-    finally:
-        owner = "@collection"
-        os.environ["BLAST_ACTIVE_TEST"] = start
-        monitor.restart_events()
+    func, args, kwargs = ForkingPickler.loads(payload)
+    # The worker serializes the return value before starting the next job.
+    return func(*args, **kwargs)

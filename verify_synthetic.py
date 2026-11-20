@@ -1,4 +1,5 @@
 """Generate independent edits and label them with a full pytest run."""
+import argparse
 import difflib
 import json
 import os
@@ -9,8 +10,14 @@ import tempfile
 import time
 from pathlib import Path
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--scope", action="store_true", help="verify class and comparison selection")
+parser.add_argument("--case", help="label one named mutation in a separate directory")
+args = parser.parse_args()
+
 BASE = Path("/opt/sqlglot")
-OUT = Path("/verification/synthetic")
+suite = "scope" if args.scope else "synthetic"
+OUT = Path("/verification") / (f"case-{args.case}" if args.case else suite)
 OUT.mkdir(exist_ok=True)
 (OUT / "commits").mkdir(exist_ok=True)
 catalog = Path("/data/tests.json")
@@ -28,6 +35,25 @@ mutations = [
     ("test-import", "tests/test_build.py",
      "import unittest\n", "import unittest\nimport blast_deliberately_missing\n"),
 ]
+if args.scope:
+    mutations = [
+        ("dialect-week", "sqlglot/dialects/bigquery.py",
+         "WEEK_OFFSET = -1", "WEEK_OFFSET = -4"),
+        ("nested-tokenizer", "sqlglot/dialects/postgres.py",
+         '"u": (16, 4, 4, 0xFFFF),', '"u": (17, 4, 4, 0xFFFF),'),
+        ("nested-delimiter", "sqlglot/dialects/postgres.py",
+         "        UNICODE_STRINGS = [(\"U&'\", \"'\"), (\"u&'\", \"'\")]",
+         "        UNICODE_STRINGS = [(\"Q&'\", \"'\"), (\"q&'\", \"'\")]"),
+        ("dispatch-closure", "sqlglot/parsers/mysql.py",
+         '"FULL COLUMNS": _show_parser("COLUMNS", target="FROM", full=True),',
+         '"FULL COLUMNS": _show_parser("COLUMNS", target="FROM", full=False),'),
+        ("comparison-overload", "sqlglot/planner.py",
+         "if self.limit is not math.inf:", "if self.limit != math.inf:"),
+    ]
+if args.case:
+    mutations = [mutation for mutation in mutations if mutation[0] == args.case]
+    if not mutations:
+        parser.error(f"unknown case in {suite}: {args.case}")
 answers = {}
 for name, filename, old, new in mutations:
     source = (BASE / filename).read_text()
