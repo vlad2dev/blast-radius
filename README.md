@@ -1,6 +1,6 @@
-# Blast Radius starter
+# Blast Radius test selector
 
-A working submission for the Blast Radius track. It runs every test on every commit, so it never misses a failure and scores badly. Your job is to run less without missing.
+Selects and schedules regression tests for SQLGlot changes using reachability measured on the pinned checkout.
 
 ## The problem
 
@@ -37,6 +37,50 @@ make check    # the output's format only
 `make sample` prints your simulated seconds and misses, which are exact for that output. The board adds the CPU seconds your container used and takes the middle of 3 runs, so expect it a little higher. Your program never sees `sample/answers.json`: only the patches and `tests.json` are mounted.
 
 `sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
+
+## Approach
+
+The image installs the exact labeling dependencies and runs the pinned test suite with
+`SKIP_INTEGRATION=0` during the build. It records Python callable entry points, fixture
+reads, and direct source-file reads. Process-pool tasks carry the submitting test's
+identity so reused workers contribute coverage to each test they serve. Setup and
+teardown observations are attributed to the test file.
+
+For each patch the selector checks unified-diff context against the pinned files.
+It narrows Python changes to observed callers when the edits stay inside existing
+callable bodies and preserve the surrounding syntax and callable metadata. It
+uses observed readers for fixture edits and schedules the full suite when parsing,
+collection, or the edit scope makes the affected tests uncertain. For each selection,
+it tries one through eight workers with longest-first balancing and chooses the
+lowest simulated cost.
+
+### Validation
+
+The hypothesis was that conservative reachability would preserve sample recall
+and cost less than confirming candidates under pytest. Three runs under the
+scorer's Docker flags produced identical output for all 30 sample commits, with
+zero misses and 457.229 simulated seconds. Median container CPU was 0.629 seconds
+and median Docker wall time was 1.213 seconds, for an estimated local score of
+457.9. The pinned map build passed 1,620 tests with one skip.
+
+A comparison run with candidate confirmation enabled scored 454.693 simulated
+seconds with zero misses, but used 34.216 CPU seconds. The image defaults to
+candidate selection. Pass `--env BLAST_CONFIRM=1` to Docker to reproduce the
+optional rerun mode.
+
+The synthetic run missed zero of four independently labeled patches. Full pytest
+reported two failing tests for the dialect function change, 56 for the tokenizer
+constant, zero for the source comment, and one for the test module's failed
+import. The selector scored 78.120 simulated seconds for that batch.
+
+Run `make synthetic` to regenerate the deterministic mutation dataset and its
+full-suite labels under the scorer's container restrictions. The verifier writes
+the patches, labels, and selector output under `.verification/`.
+
+Full-suite fallbacks dominate the remaining sample cost. Baseline reachability
+can miss interactions through state shared across tests or native code. The next
+experiment would add coverage inside heavily used functions and validate that
+narrowing on independent mutations.
 
 ## Submit
 
