@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!requirements.lock
+!selector.py
+!test_observer.py
+!sitecustomize.py

@@ -1,0 +1,2 @@
+# Preserve the official unified diff bytes, including blank context lines.
+sample/commits/*.patch -text -whitespace
