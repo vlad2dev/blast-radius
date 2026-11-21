@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import unittest
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing.reduction import ForkingPickler
@@ -27,6 +28,7 @@ receiver_codes = {}
 fixtures = defaultdict(set)
 identity_sites = set()
 collected = set()
+plain_unittest = set()
 source_reads = defaultdict(set)
 finished = set()
 failures = set()
@@ -111,6 +113,18 @@ if BUILD:
 
 def pytest_collection_finish(session):
     collected.update(item.nodeid for item in session.items)
+    if BUILD:
+        for item in session.items:
+            cls = getattr(item, "cls", None)
+            if not isinstance(cls, type) or not issubclass(cls, unittest.TestCase):
+                continue
+            if item.nodeid.count("::") != 2 or "[" in item.nodeid or list(item.iter_markers()):
+                continue
+            # Keep pytest-only fixtures and autouse hooks in the full selector.
+            fixtures = {"request", "_unittest_setUpClass_fixture_" + cls.__qualname__}
+            if set(item.fixturenames) - fixtures:
+                continue
+            plain_unittest.add(item.nodeid)
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -190,6 +204,7 @@ def pytest_sessionfinish(session, exitstatus):
         owners = sorted(set().union(*coverage.values()))
         numbers = {owner: number for number, owner in enumerate(owners)}
         data["owners"] = owners
+        data["plain_unittest"] = sorted(plain_unittest - failures)
         data["dictionary_lookups"] = [
             kind for kind in ("numeric-escape", "keyword", "parser-rule")
             if any(key.startswith(kind + "/") for key in coverage)

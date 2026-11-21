@@ -174,6 +174,29 @@ captured-default mutation broke nine tests and retained the full suite
 because the baseline probe recorded a collection-time call. This is an
 unresolved source of overhead on batches with import-time dependencies.
 
+## Near-minimum experiment
+
+Call-site tracking separates consumers of a function's default from callers
+that supply their own argument. For the independently labeled captured-default
+mutation, the baseline collection-time call provided the argument explicitly.
+Tracking actual default consumers reduced the schedule from 36.817 to 2.003
+simulated seconds and retained all nine failing tests. Literal changes to
+otherwise unchanged function signatures are also eligible for selection
+using callable entry coverage.
+
+The selector can confirm small sets of baseline-approved unittest cases
+without starting pytest. It retains the static selection when an import,
+setup, timeout, skip, or incomplete execution prevents confirmation. A
+per-batch CPU budget and a higher threshold for shared fixture setup limit
+the cost. Set `BLAST_QUICK=0` to disable this confirmation.
+
+Three scorer-constrained sample runs produced identical schedules with
+97.098 simulated seconds and zero misses. Median container CPU was 7.595
+seconds, for an estimated local score of 104.7. Zero misses were also
+observed across 14 independently labeled synthetic patches. With CPU
+excluded the sample result is 2.747 seconds above its 94.351-second minimum.
+The scorer's hidden batch can have a different minimum.
+
 ## Submit
 
 Push to a public GitHub repository with the `Dockerfile` at its top, then enter the repository and the commit hash on the track page. The final scores the commit you pick. If you pick none, your best practice submission counts.

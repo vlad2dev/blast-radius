@@ -37,6 +37,9 @@ mutations = [
 ]
 if args.scope:
     mutations = [
+        ("signature-default", "sqlglot/diff.py",
+         "    delta_only: bool = False,\n    **kwargs: t.Any,",
+         "    delta_only: bool = True,\n    **kwargs: t.Any,"),
         ("captured-default", "sqlglot/errors.py",
          "ERROR_MESSAGE_CONTEXT_DEFAULT = 100", "ERROR_MESSAGE_CONTEXT_DEFAULT = 0"),
         ("module-limit", "sqlglot/typing/snowflake.py",

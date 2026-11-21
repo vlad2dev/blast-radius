@@ -405,6 +405,40 @@ def project_source_files():
     )
 
 
+
+@cache
+def default_call_sites(name, parameter, position):
+    """Follow direct uses of a default; unknown function escapes retain entry coverage."""
+    keys = set()
+    encoded = name.encode()
+    for path, source in project_source_files():
+        if encoded not in source:
+            continue
+        tree = module_syntax(path)
+        parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+        for node in parents:
+            if (
+                isinstance(node, ast.alias) and node.name == name and node.asname not in (None, name)
+                or isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value == name
+            ):
+                return None
+            if not (
+                isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load)
+                or isinstance(node, ast.Attribute) and node.attr == name and isinstance(node.ctx, ast.Load)
+            ):
+                continue
+            call = parents[node]
+            if not isinstance(call, ast.Call) or call.func is not node:
+                return None
+            if any(keyword.arg == parameter for keyword in call.keywords):
+                continue
+            has_star = any(isinstance(arg, ast.Starred) for arg in call.args)
+            if position is not None and not has_star and len(call.args) > position:
+                continue
+            keys.update(f"{path}#{line}" for line in range(call.lineno, call.end_lineno + 1))
+    return tuple(sorted(keys))
+
+
 @cache
 def binding_consumers(attribute, bare_names=False):
     """Map configuration reads to lines, or calls for captured defaults."""
@@ -439,9 +473,28 @@ def binding_consumers(attribute, bare_names=False):
         default_owner = {}
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                defaults = [*node.args.defaults, *(v for v in node.args.kw_defaults if v is not None)]
-                for expression in defaults:
-                    default_owner.update((child, node) for child in ast.walk(expression))
+                positional = [*node.args.posonlyargs, *node.args.args]
+                offset = len(positional) - len(node.args.defaults)
+                defaults = [
+                    (expression, positional[index].arg, index)
+                    for index, expression in enumerate(node.args.defaults, offset)
+                    if index >= len(node.args.posonlyargs)
+                ]
+                defaults.extend(
+                    (expression, None, None)
+                    for index, expression in enumerate(node.args.defaults, offset)
+                    if index < len(node.args.posonlyargs)
+                )
+                defaults.extend(
+                    (expression, argument.arg, None)
+                    for argument, expression in zip(node.args.kwonlyargs, node.args.kw_defaults)
+                    if expression is not None
+                )
+                for expression, parameter, position in defaults:
+                    default_owner.update(
+                        (child, (node, expression, parameter, position))
+                        for child in ast.walk(expression)
+                    )
 
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in symbols:
@@ -453,15 +506,23 @@ def binding_consumers(attribute, bare_names=False):
                 isinstance(node, ast.Attribute) and node.attr in symbols and isinstance(node.ctx, ast.Load)
             ):
                 continue
-            owner = default_owner.get(node)
-            if owner is None:
+            default = default_owner.get(node)
+            if default is None:
                 keys.update(f"{path}#{line}" for line in range(node.lineno, node.end_lineno + 1))
                 continue
+            owner, expression, parameter, position = default
             if owner.decorator_list:
                 # Decorators can inspect or execute the function at definition
                 # time. Retain the broader fallback for these bindings.
                 return (), ()
-            keys.add(f"{path}:{owner.lineno}")
+            call_sites = (
+                default_call_sites(owner.name, parameter, position)
+                if parameter and node is expression and owner in tree.body else None
+            )
+            if call_sites is None:
+                keys.add(f"{path}:{owner.lineno}")
+            else:
+                keys.update(call_sites)
             names.add(owner.name)
     return tuple(sorted(keys)), tuple(sorted(names))
 
@@ -555,12 +616,52 @@ def module_constant_candidates(path, source, updated, mapping, by_file):
     candidates = set()
     for name in changed:
         keys, names = binding_consumers(name, bare_names=True)
+        if any(
+            any(symbol.encode() in candidate.read_bytes() for symbol in names)
+            for candidate in (BASE / "tests").rglob("*.py")
+            if candidate.relative_to(BASE).as_posix() not in by_file
+        ):
+            return None
         consumers = observed_on(mapping, keys)
         if not consumers or COLLECTION in consumers:
             return None
         candidates.update(consumers)
         candidates.update(references_class(by_file, set(names)))
     return candidates
+
+
+def signature_candidates(path, source, updated, mapping, by_file):
+    """Scope literal defaults changed in otherwise identical module functions."""
+    original, patched = ast.parse(source), ast.parse(updated)
+    affected = []
+    for old, new in zip(original.body, patched.body):
+        if not (
+            isinstance(old, (ast.FunctionDef, ast.AsyncFunctionDef)) and type(old) is type(new)
+            and old.name == new.name and not old.decorator_list
+            and len(old.args.defaults) == len(new.args.defaults)
+            and len(old.args.kw_defaults) == len(new.args.kw_defaults)
+        ):
+            continue
+        for old_defaults, new_defaults in (
+            (old.args.defaults, new.args.defaults), (old.args.kw_defaults, new.args.kw_defaults)
+        ):
+            for index, (before, after) in enumerate(zip(old_defaults, new_defaults)):
+                if (
+                    before is not None and after is not None
+                    and ast.dump(before) != ast.dump(after)
+                    and literal_value(before) and literal_value(after)
+                    and same_value_shape(before, after, original)
+                ):
+                    old_defaults[index] = after
+                    affected.append((old.name, old.lineno))
+    if not affected or ast.dump(original) != ast.dump(patched):
+        return None
+    compile(updated, path, "exec")
+    owners = observed_on(mapping, (f"{path}:{line}" for _, line in affected))
+    if not owners or COLLECTION in owners:
+        return None
+    owners.update(references_class(by_file, {name for name, _ in affected}))
+    return owners
 
 
 def candidate_tests(edits, mapping, by_file, all_ids):
@@ -581,6 +682,8 @@ def candidate_tests(edits, mapping, by_file, all_ids):
                     class_owners = class_candidates(path, source, updated, mapping, by_file)
                     if class_owners is None:
                         class_owners = module_constant_candidates(path, source, updated, mapping, by_file)
+                    if class_owners is None:
+                        class_owners = signature_candidates(path, source, updated, mapping, by_file)
                     if class_owners is None:
                         return all_ids, ()
                     owners.update(class_owners)
@@ -689,6 +792,36 @@ def confirm(edits, candidates, all_ids, by_file, timeout):
         return (failures | (candidates - set(data["finished"]))) & all_ids
 
 
+@cache
+def class_fixture_cost(path, class_name):
+    """Identify test groups with class-level fixture setup."""
+    return any(
+        isinstance(node, ast.ClassDef) and node.name == class_name
+        and any(
+            isinstance(member, ast.FunctionDef)
+            and member.name in {"setUpClass", "tearDownClass"}
+            for member in node.body
+        )
+        for node in ast.walk(module_syntax(path))
+    )
+
+
+def confirm_unittest(edits, candidates, timeout):
+    """Keep the static set unless every approved case ran to completion."""
+    with tempfile.TemporaryDirectory(prefix="blast-") as scratch:
+        scratch = Path(scratch)
+        tree = patched_tree(scratch, edits)
+        requested = scratch / "selected.json"
+        response = scratch / "failed.json"
+        requested.write_text(json.dumps(sorted(candidates)))
+        env = dict(os.environ, PYTHONPATH=str(tree))
+        cmd = [sys.executable, str(APP / "quick_unittest.py"), str(requested), str(response)]
+        if run_in_tree(cmd, tree, env, timeout) != 0 or not response.is_file():
+            return candidates
+        failed = set(json.loads(response.read_text()))
+        return failed if failed <= candidates else candidates
+
+
 def cpu_seconds():
     children = resource.getrusage(resource.RUSAGE_CHILDREN)
     return time.process_time() + children.ru_utime + children.ru_stime
@@ -705,6 +838,8 @@ def main():
     mapping = json.loads((APP / "reachability.json").read_text())
     healthy = not mapping["collection_errors"] and all_ids <= set(mapping["finished"])
     confirm_candidates = os.environ.get("BLAST_CONFIRM") == "1"
+    quick_check = os.environ.get("BLAST_QUICK", "1") == "1"
+    plain_unittest = set(mapping.get("plain_unittest", ()))
     deadline = time.monotonic() + 145
     confirmation_credit = 3.0
     for patch in sorted((DATA / "commits").glob("*.patch")):
@@ -721,6 +856,27 @@ def main():
             except (OSError, ValueError, SyntaxError, RecursionError, subprocess.TimeoutExpired):
                 candidates = all_ids
                 edits = None
+            if (
+                quick_check and confirmation_credit > 0.5 and edits
+                and 0 < len(candidates) <= 16 and candidates <= plain_unittest
+                and all(path.startswith("sqlglot/") and path.endswith(".py") for path in edits)
+            ):
+                total = sum(tests[nodeid][1] for nodeid in candidates) / 1000
+                setup = any(
+                    class_fixture_cost(path, cls)
+                    for path, cls, _ in (nodeid.split("::") for nodeid in candidates)
+                )
+                budget = min(3.0 if setup else 1.4, 0.73 * cost / 1000)
+                timeout = min(budget, deadline - time.monotonic())
+                if total <= 2.3 and timeout > 0.4 and (not setup or budget >= 2.6):
+                    started = cpu_seconds()
+                    previous_cost = cost
+                    try:
+                        verified = confirm_unittest(edits, candidates, timeout)
+                        workers, cost = schedule(verified, tests)
+                    except (OSError, ValueError, subprocess.TimeoutExpired):
+                        pass
+                    confirmation_credit += (previous_cost - cost) / 1000 - (cpu_seconds() - started)
             if (
                 confirm_candidates and confirmation_credit > 0.5
                 and edits and 0 < len(candidates) < len(all_ids)
