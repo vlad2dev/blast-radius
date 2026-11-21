@@ -109,6 +109,14 @@ def install(root, record, record_lookup):
         record_key(kind, table, key)
         return table[key]
 
+    def contains(kind, key, table, negate):
+        record_key(kind, table, key)
+        if kind == "keyword":
+            record_lookup(f"keyword-membership/{key}")
+        result = key in table
+        return not result if negate else result
+
+    builtins._blast_observe_contains = contains
     setattr(builtins, PROBE, observe)
     builtins._blast_observe_lookup = lookup
     builtins._blast_observe_item = lookup_item
@@ -198,6 +206,13 @@ def install(root, record, record_lookup):
 
         def visit_Compare(self, node):
             node = self.generic_visit(node)
+            if (len(node.ops) == 1 and isinstance(node.ops[0], (ast.In, ast.NotIn))
+                and (kind := self.dictionary_kind(node.comparators[0]))):
+                self.changed = True
+                return ast.copy_location(ast.Call(
+                    func=ast.Name(id="_blast_observe_contains", ctx=ast.Load()),
+                    args=[ast.Constant(kind), node.left, node.comparators[0], ast.Constant(isinstance(node.ops[0], ast.NotIn))],
+                    keywords=[]), node)
             if not (identity_site(node) or order_site(node)):
                 return node
             self.changed = True

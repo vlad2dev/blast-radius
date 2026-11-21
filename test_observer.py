@@ -238,7 +238,7 @@ def pytest_sessionfinish(session, exitstatus):
         data["test_references"] = index_test_references()
         data["plain_unittest"] = sorted(plain_unittest - failures)
         data["dictionary_lookups"] = [
-            kind for kind in ("numeric-escape", "numeric-origin", "keyword", "parser-rule")
+            kind for kind in ("numeric-escape", "numeric-origin", "keyword", "keyword-membership", "parser-rule")
             if any(key.startswith(kind + "/") for key in coverage)
         ]
         # This table describes observed operand semantics at source locations.

@@ -453,6 +453,8 @@ def class_changes(path, source, updated):
             elif enclosing and (attribute := attribute_name(a)) and attribute == attribute_name(b):
                 if not same_ast(a.value, b.value) and (
                     same_value_shape(a.value, b.value, old)
+                    or (literal_value(a.value) and literal_value(b.value)
+                        and type(ast.literal_eval(a.value)) is type(ast.literal_eval(b.value)))
                     or pure_registry_delta(path, attribute, a.value, b.value, old)
                 ):
                     changed.append((enclosing, attribute, a.value, b.value))
@@ -607,6 +609,35 @@ def scalar_literal(node):
     )
 
 
+@cache
+def ordinary_keyword_characters():
+    """Conservatively collect punctuation that feeds the pinned keyword tries."""
+    punctuation = set()
+    for path, source in project_source_files():
+        if b"SINGLE_TOKENS" not in source:
+            continue
+        for node in ast.walk(module_syntax(path)):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and attribute_name(node) == "SINGLE_TOKENS":
+                if isinstance(node.value, ast.Dict):
+                    for key, value in zip(node.value.keys, node.value.values):
+                        if key is None:
+                            if not isinstance(value, ast.Attribute) or value.attr != "SINGLE_TOKENS":
+                                return None
+                        elif isinstance(key, ast.Constant) and isinstance(key.value, str):
+                            punctuation.update(key.value)
+                        else:
+                            return None
+                elif isinstance(node.value, ast.Call):
+                    call = node.value
+                    if (call.args or call.keywords or not isinstance(call.func, ast.Attribute)
+                        or call.func.attr != "copy" or not isinstance(call.func.value, ast.Attribute)
+                        or call.func.value.attr != "SINGLE_TOKENS"):
+                        return None
+                elif not isinstance(node.value, ast.Attribute) or node.value.attr != "SINGLE_TOKENS":
+                    return None
+    return frozenset(punctuation)
+
+
 def value_consumers(path, attribute, old, new):
     if scalar_literal(old) and scalar_literal(new):
         return binding_consumers(attribute)[0]
@@ -617,11 +648,17 @@ def value_consumers(path, attribute, old, new):
         kind = "parser-rule"
     if kind == "keyword" and isinstance(old, ast.Dict) and isinstance(new, ast.Dict):
         left, right = named_entries(old), named_entries(new)
-        if left is not None and right is not None and right.keys() < left.keys():
-            removed = left.keys() - right.keys()
+        if left is not None and right is not None and left.keys() != right.keys():
+            removed = left.keys() ^ right.keys()
+            removed.update(key for key in left.keys() & right.keys() if not same_ast(left[key], right[key]))
             # In the pinned tokenizer, ordinary words do not change the
             # punctuation/multiword trie or the special hint and join keys.
-            if all(re.fullmatch(r"[A-Z][A-Z0-9_]*", key) for key in removed):
+            # Added keys also require negative membership observations.
+            punctuation = ordinary_keyword_characters()
+            if punctuation is not None and all(
+                re.fullmatch(r"[A-Z][A-Z0-9_]*", key) and not (set(key) & punctuation)
+                for key in removed
+            ):
                 return tuple(f"keyword/{key}" for key in sorted(removed))
     if (
         kind and isinstance(old, ast.Dict) and isinstance(new, ast.Dict)
@@ -722,7 +759,7 @@ def class_candidates(path, source, updated, mapping, by_file):
         if not roots - {COLLECTION}:
             return None
         dependents = ()
-        if attribute in {"KEYWORDS", "NUMERIC_ESCAPES", "SHOW_PARSERS"}:
+        if attribute:
             dependents = registry_dependents(path, outer, attribute)
             if dependents is None:
                 return None
@@ -733,6 +770,11 @@ def class_candidates(path, source, updated, mapping, by_file):
                 roots.update(propagated)
                 candidates.update(references_class(mapping, {cls, attribute}))
         keys = value_consumers(path, attribute, old, new)
+        if (attribute == "KEYWORDS" and isinstance(old, ast.Dict) and isinstance(new, ast.Dict)
+            and "keyword-membership" not in mapping["dictionary_lookups"]):
+            left, right = named_entries(old), named_entries(new)
+            if left is not None and right is not None and right.keys() - left.keys():
+                keys = ()
         if not dependents and keys and keys[0].startswith("numeric-escape/") and "numeric-origin" in mapping["dictionary_lookups"]:
             escapes = [key.split("/", 1)[1] for key in keys]
             keys = tuple(
@@ -835,6 +877,95 @@ def signature_candidates(path, source, updated, mapping):
     return owners
 
 
+@cache
+def isolated_test_module(path):
+    """Require a declarative test module with no pinned inbound references."""
+    target = BASE / path
+    if not target.name.startswith("test_") or target.name == "conftest.py":
+        return False
+    stem = re.compile(rb"(?<![A-Za-z0-9_])" + re.escape(target.stem.encode()) + rb"(?![A-Za-z0-9_])")
+    for folder in (BASE / "tests", BASE / "sqlglot"):
+        for other in folder.rglob("*.py"):
+            if other != target and stem.search(other.read_bytes()):
+                return False
+    tree = module_syntax(path)
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            continue
+        if isinstance(node, ast.FunctionDef) and not node.decorator_list:
+            if any(not literal_value(x) for x in (*node.args.defaults, *filter(None, node.args.kw_defaults))):
+                return False
+            continue
+        if not isinstance(node, ast.ClassDef) or node.decorator_list or node.keywords:
+            return False
+        if len(node.bases) != 1 or ast.unparse(node.bases[0]) != "unittest.TestCase":
+            return False
+        for child in node.body:
+            if isinstance(child, ast.FunctionDef) and not child.decorator_list:
+                if all(literal_value(x) for x in (*child.args.defaults, *filter(None, child.args.kw_defaults))):
+                    continue
+            if isinstance(child, ast.Assign) and literal_value(child.value):
+                continue
+            if isinstance(child, ast.Expr) and isinstance(child.value, ast.Constant):
+                continue
+            return False
+    return True
+
+
+def test_module_candidates(path, edit, by_file):
+    if path not in by_file or not isolated_test_module(path):
+        return None
+    source, updated, _, _ = edit
+    old, new = ast.parse(source), ast.parse(updated)
+    # Existing imports and declarations must remain in order. Added imports can
+    # fail collection of this isolated module; they cannot modify package globals
+    # when they name modules outside the pinned source. Unknown imports stay broad.
+    extras = [node for node in new.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+    old_imports = [node for node in old.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+    if len(extras) > len(old_imports):
+        pending = list(old_imports)
+        for node in extras:
+            if pending and same_ast(node, pending[0]):
+                pending.pop(0)
+                continue
+            names = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
+            # A failed, standard import cannot execute the rest of the module.
+            # Prove absence without importing candidate-controlled code.
+            import importlib.util
+            if isinstance(node, ast.ImportFrom) and node.level:
+                return None
+            if len(names) != 1 or "." in names[0] or not names[0].isidentifier():
+                return None
+            if importlib.util.find_spec(names[0]) is not None:
+                return None
+        if pending:
+            return None
+        new.body = [n for n in new.body if not isinstance(n, (ast.Import, ast.ImportFrom))]
+        old.body = [n for n in old.body if not isinstance(n, (ast.Import, ast.ImportFrom))]
+        return set(by_file[path]) if same_ast(old, new) else None
+
+    class Assertions(ast.NodeTransformer):
+        def visit_FunctionDef(self, node):
+            self.generic_visit(node)
+            # An unconditional pure assertion adds no behavior outside the test.
+            node.body = [stmt for stmt in node.body if not (
+                isinstance(stmt, ast.Assert) and literal_value(stmt.test)
+                and (stmt.msg is None or literal_value(stmt.msg))
+            )]
+            return node
+        def visit_Call(self, node):
+            if (isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "self" and node.func.attr.startswith("assert")):
+                node.args = [ast.Constant(None) if literal_value(arg) else arg for arg in node.args]
+                for keyword in node.keywords:
+                    if literal_value(keyword.value):
+                        keyword.value = ast.Constant(None)
+            return self.generic_visit(node)
+    return set(by_file[path]) if same_ast(Assertions().visit(old), Assertions().visit(new)) else None
+
+
 def candidate_tests(edits, mapping, by_file, all_ids):
     selected = set(mapping["failed"])
     class_modules = []
@@ -871,6 +1002,11 @@ def candidate_tests(edits, mapping, by_file, all_ids):
                 return all_ids, ()
             for owner in owners:
                 selected.update(by_file.get(owner, (owner,)))
+        elif path.startswith("tests/") and path.endswith(".py"):
+            owners = test_module_candidates(path, edit, by_file)
+            if owners is None:
+                return all_ids, ()
+            selected.update(owners)
         else:
             return all_ids, ()
     return selected & all_ids, class_modules
