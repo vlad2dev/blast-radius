@@ -1,6 +1,8 @@
 """Label exactly one public mutation with the whole pytest suite."""
 import json,os,shutil,subprocess,sys,tempfile,time
 from pathlib import Path
+import hashlib
+ORACLE_HASH=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 sys.path.insert(0,'/app')
 from selector import apply_patch
 patch=Path(sys.argv[1]); tests=json.loads(Path('/gold/tests.json').read_text())['tests'];base=Path('/opt/sqlglot')
@@ -22,9 +24,12 @@ with tempfile.TemporaryDirectory(prefix='oracle-') as work:
  if run.returncode not in (0,1,2) or not reports or not all(p.exists() for p in reports):raise RuntimeError(run.stdout[-4000:]+run.stderr[-2000:])
  data={key:sorted({item for p in reports for item in json.loads(p.read_text())[key]}) for key in ('finished','failed','collection_errors')}
  errors=set(data['collection_errors'])
- by_file={t['file'] for t in tests};assert errors<=by_file,errors
- required={t['id'] for t in tests if t['file'] not in errors}
+ # A collection error can occur in a test module with no numbered tests
+ # (for example test_docs). It contributes no additional catalog IDs.
+ assert all(e.startswith('tests') and (base/e).exists() for e in errors), errors
+ def covered(filename):return any(filename==e or filename.startswith(e.rstrip('/')+'/') for e in errors)
+ required={t['id'] for t in tests if not covered(t['file'])}
  assert required<=set(data['finished']),str(sorted(required-set(data['finished']))[:20])
- failed=set(data['failed']);failed.update(t['id'] for t in tests if t['file'] in errors)
+ failed=set(data['failed']);failed.update(t['id'] for t in tests if covered(t['file']))
  assert failed<={t['id'] for t in tests},str(failed-{t['id'] for t in tests})
- print(json.dumps(dict(failing=sorted(t['number'] for t in tests if t['id'] in failed),kind='independent-mutation',wall=time.monotonic()-start,completed=len(data['finished']),collection_errors=sorted(errors))))
+ print(json.dumps(dict(oracle_sha256=ORACLE_HASH,failing=sorted(t['number'] for t in tests if t['id'] in failed),kind='independent-mutation',wall=time.monotonic()-start,completed=len(data['finished']),collection_errors=sorted(errors))))
