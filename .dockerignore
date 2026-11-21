@@ -7,3 +7,4 @@
 !receiver_probes.py
 !comparison_probe.py
 !quick_unittest.py
+!coverage_index.py

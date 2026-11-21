@@ -85,24 +85,75 @@ def install(root, record, record_lookup):
             record(key + "/unproven")
         return (left is not right) if operation == "IsNot" else (left is right)
 
+    numeric_registries = {}
+
+    def register_numeric(origin, table):
+        if type(table) is dict:
+            numeric_registries[id(table)] = (table, origin)
+        return table
+
+    def record_key(kind, table, key):
+        if not isinstance(key, str):
+            return
+        if kind == "numeric-escape":
+            registry = numeric_registries.get(id(table))
+            origin = registry[1] if registry and registry[0] is table else "unknown"
+            record_lookup(f"numeric-origin/{origin}/{key}")
+        record_lookup(f"{kind}/{key}")
+
     def lookup(kind, table, key, *default):
-        if isinstance(key, str):
-            record_lookup(f"{kind}/{key}")
+        record_key(kind, table, key)
         return table.get(key, *default)
 
     def lookup_item(kind, table, key):
-        if isinstance(key, str):
-            record_lookup(f"{kind}/{key}")
+        record_key(kind, table, key)
         return table[key]
 
     setattr(builtins, PROBE, observe)
     builtins._blast_observe_lookup = lookup
     builtins._blast_observe_item = lookup_item
+    builtins._blast_register_numeric = register_numeric
 
     class Observe(ast.NodeTransformer):
         def __init__(self, path):
             self.path = path
+            self.classes = []
             self.changed = False
+
+        def visit_ClassDef(self, node):
+            self.classes.append(node.name)
+            try:
+                return self.generic_visit(node)
+            finally:
+                self.classes.pop()
+
+        def tag_numeric(self, target, value):
+            if (
+                self.classes and isinstance(target, ast.Name) and target.id == "NUMERIC_ESCAPES"
+                and isinstance(value, ast.Dict)
+            ):
+                origin = self.path + ":" + ".".join(self.classes)
+                self.changed = True
+                return ast.copy_location(
+                    ast.Call(
+                        func=ast.Name(id="_blast_register_numeric", ctx=ast.Load()),
+                        args=[ast.Constant(origin), value],
+                        keywords=[],
+                    ),
+                    value,
+                )
+            return value
+
+        def visit_Assign(self, node):
+            node = self.generic_visit(node)
+            if len(node.targets) == 1:
+                node.value = self.tag_numeric(node.targets[0], node.value)
+            return node
+
+        def visit_AnnAssign(self, node):
+            node = self.generic_visit(node)
+            node.value = self.tag_numeric(node.target, node.value)
+            return node
 
         def dictionary_kind(self, node):
             name = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
@@ -167,7 +218,7 @@ def install(root, record, record_lookup):
         filename = loader.get_filename(fullname)
         if filename.startswith(source_root):
             source = loader.get_data(filename)
-            if any(token in source for token in (b" is ", b"<", b">")):
+            if any(token in source for token in (b" is ", b"<", b">", b"NUMERIC_ESCAPES")):
                 transform = Observe(filename[len(str(root)) + 1 :])
                 tree = transform.visit(ast.parse(source, filename=filename))
                 if transform.changed:

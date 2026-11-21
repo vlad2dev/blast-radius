@@ -1,5 +1,6 @@
 """Collect test reachability or report failures with pytest's native hooks."""
 
+import ast
 import json
 import os
 import sys
@@ -183,6 +184,36 @@ def pytest_collectreport(report):
         collection_errors.add(report.nodeid)
 
 
+def index_test_references():
+    """Index lexical references once while the pinned catalog is available."""
+    files = defaultdict(set)
+    for nodeid in collected:
+        files[nodeid.split("::", 1)[0]].add(nodeid)
+    references = defaultdict(set)
+    for filename, ids in files.items():
+        methods = defaultdict(set)
+        for nodeid in ids:
+            methods[nodeid.rsplit("::", 1)[-1].split("[", 1)[0]].add(nodeid)
+        pending = [(ast.parse((ROOT / filename).read_bytes()), None)]
+        while pending:
+            node, owner = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+                owner = node.name
+            symbol = None
+            if isinstance(node, ast.Name):
+                symbol = node.id
+            elif isinstance(node, ast.Attribute):
+                symbol = node.attr
+            elif isinstance(node, ast.alias) and node.asname is not None:
+                symbol = node.name
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.isidentifier():
+                symbol = node.value
+            if symbol:
+                references[symbol].update(ids if owner is None else methods[owner])
+            pending.extend((child, owner) for child in ast.iter_child_nodes(node))
+    return {name: sorted(ids) for name, ids in references.items()}
+
+
 def pytest_sessionfinish(session, exitstatus):
     data = {
         "collected": sorted(collected),
@@ -204,9 +235,10 @@ def pytest_sessionfinish(session, exitstatus):
         owners = sorted(set().union(*coverage.values()))
         numbers = {owner: number for number, owner in enumerate(owners)}
         data["owners"] = owners
+        data["test_references"] = index_test_references()
         data["plain_unittest"] = sorted(plain_unittest - failures)
         data["dictionary_lookups"] = [
-            kind for kind in ("numeric-escape", "keyword", "parser-rule")
+            kind for kind in ("numeric-escape", "numeric-origin", "keyword", "parser-rule")
             if any(key.startswith(kind + "/") for key in coverage)
         ]
         # This table describes observed operand semantics at source locations.

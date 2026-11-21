@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 
 
-def main():
-    requested = json.loads(Path(sys.argv[1]).read_text())
+def main(request, response):
+    requested = json.loads(request.read_text())
     selected = []
     for nodeid in requested:
         path, class_name, method = nodeid.split("::")
@@ -31,9 +31,9 @@ def main():
         if nodeid is None:
             return 2
         failed.add(nodeid)
-    Path(sys.argv[2]).write_text(json.dumps(sorted(failed)))
+    response.write_text(json.dumps(sorted(failed)))
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(Path(sys.argv[1]), Path(sys.argv[2])))

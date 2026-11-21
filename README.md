@@ -197,6 +197,27 @@ observed across 14 independently labeled synthetic patches. With CPU
 excluded the sample result is 2.747 seconds above its 94.351-second minimum.
 The scorer's hidden batch can have a different minimum.
 
+## Indexed coverage experiment
+
+The runner now reads only the coverage and test-reference entries required
+for a patch. It compares Python syntax directly, uses checked-hash caches for
+unchanged test modules, and shares the loaded standard library when starting
+small unittest confirmations. Numeric escape reads are attributed to the
+specific baseline dictionary. Reads from unrecognized dictionaries retain
+the conservative fallback.
+
+Three scorer-constrained runs produced identical output with 97.098 simulated
+seconds and zero misses. Median container CPU was 3.962 seconds, for an estimated
+local score of 101.1. All 14 independently labeled synthetic patches had zero
+misses. One numeric-escape mutation retained its single failing test with
+2.156 simulated seconds, down from 4.566 in the preceding candidate.
+The build-time baseline passed 1,620 tests with one skip.
+
+The sample's 94.351-second minimum was independently checked against the
+official scorer using a schedule of only its labeled failures. A bound from
+each patch's longest test and average worker load attains the same total.
+Those labels were used only for offline validation.
+
 ## Submit
 
 Push to a public GitHub repository with the `Dockerfile` at its top, then enter the repository and the commit hash on the track page. The final scores the commit you pick. If you pick none, your best practice submission counts.

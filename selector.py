@@ -3,6 +3,7 @@
 import ast
 import inspect
 import json
+import multiprocessing
 import os
 import re
 import resource
@@ -18,6 +19,8 @@ from pathlib import Path, PurePosixPath
 from types import CodeType
 
 from comparison_probe import identity_site, order_site
+from coverage_index import load as load_coverage
+from quick_unittest import main as quick_unittest
 
 DATA = Path("/data")
 APP = Path(__file__).resolve().parent
@@ -30,6 +33,26 @@ COLLECTION = "@collection"
 def require(condition):
     if not condition:
         raise ValueError("unsupported or inconsistent unified diff")
+
+
+def same_ast(left, right):
+    """Compare syntax, ignoring source locations and retaining literal types."""
+    kind = type(left)
+    if kind is not type(right):
+        return False
+    if isinstance(left, ast.AST):
+        for field in left._fields:
+            if not same_ast(getattr(left, field, None), getattr(right, field, None)):
+                return False
+        return True
+    if kind is list:
+        if len(left) != len(right):
+            return False
+        for a, b in zip(left, right):
+            if not same_ast(a, b):
+                return False
+        return True
+    return left == right
 
 
 def apply_patch(patch, base):
@@ -162,7 +185,7 @@ def statement_lines(path, original, modified, removed, inserted):
 
     old_lines, old_type = replace_header(old_tree)
     new_lines, new_type = replace_header(new_tree)
-    if old_lines == new_lines and old_type == new_type and ast.dump(old_tree) == ast.dump(new_tree):
+    if old_lines == new_lines and old_type == new_type and same_ast(old_tree, new_tree):
         return old_lines
     return ()
 
@@ -191,7 +214,7 @@ def safe_comparison_edit(path, source, updated, mapping):
             return False
         node.ops[0] = counterpart.ops[0]
         changed = True
-    return changed and ast.dump(old) == ast.dump(new)
+    return changed and same_ast(old, new)
 
 
 def observed_on(mapping, keys):
@@ -209,9 +232,9 @@ def changed_functions(path, edit):
     after = FunctionBodies(modified)
     left_code = external_code(compile(original, path, "exec"))
     right_code = external_code(compile(modified, path, "exec"))
-    left = ast.dump(before.visit(ast.parse(original, filename=path)))
-    right = ast.dump(after.visit(ast.parse(modified, filename=path)))
-    if left != right:
+    left = before.visit(ast.parse(original, filename=path))
+    right = after.visit(ast.parse(modified, filename=path))
+    if not same_ast(left, right):
         return None
 
     affected = set()
@@ -309,7 +332,7 @@ def resolves_enum(name, tree, depth=0):
 
 def same_value_shape(old, new, tree):
     """Allow value-only changes while preserving keys, types, and call binding."""
-    if ast.dump(old) == ast.dump(new):
+    if same_ast(old, new):
         return True
     if type(old) is not type(new):
         return False
@@ -334,7 +357,7 @@ def same_value_shape(old, new, tree):
         )
     if isinstance(old, ast.Call):
         return (
-            isinstance(old.func, ast.Name) and ast.dump(old.func) == ast.dump(new.func)
+            isinstance(old.func, ast.Name) and same_ast(old.func, new.func)
             and closure_factory(old.func.id, tree)
             and len(old.args) == len(new.args)
             and [kw.arg for kw in old.keywords] == [kw.arg for kw in new.keywords]
@@ -360,41 +383,20 @@ def class_changes(path, source, updated):
             if isinstance(a, ast.ClassDef) and isinstance(b, ast.ClassDef) and a.name == b.name:
                 compare_classes(a, b, f"{enclosing}.{a.name}" if enclosing else a.name)
             elif enclosing and (attribute := attribute_name(a)) and attribute == attribute_name(b):
-                if ast.dump(a.value) != ast.dump(b.value) and same_value_shape(a.value, b.value, old):
+                if not same_ast(a.value, b.value) and same_value_shape(a.value, b.value, old):
                     changed.append((enclosing, attribute, a.value, b.value))
                     a.value = b.value
 
     compare_classes(old, new)
-    if changed and ast.dump(old) == ast.dump(new):
+    if changed and same_ast(old, new):
         return changed
     return ()
 
 
-def references_class(by_file, names):
+def references_class(mapping, names):
     """Cover direct test references, including tests that only inspect a class."""
-    results = set()
-    for filename, ids in by_file.items():
-        raw = (BASE / filename).read_bytes()
-        if not any(name.encode() in raw for name in names):
-            continue
-        tree = module_syntax(filename)
-        pending = [(tree, None)]
-        while pending:
-            node, owner = pending.pop()
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
-                owner = node.name
-            if (
-                isinstance(node, ast.alias) and node.name in names and node.asname is not None
-                or isinstance(node, ast.Name) and node.id in names
-                or isinstance(node, ast.Attribute) and node.attr in names
-                or isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in names
-            ):
-                results.update(
-                    nodeid for nodeid in ids
-                    if owner is None or nodeid.rsplit("::", 1)[-1].split("[", 1)[0] == owner
-                )
-            pending.extend((child, owner) for child in ast.iter_child_nodes(node))
-    return results
+    index = mapping["test_references"]
+    return {nodeid for name in names for nodeid in index.get(name, ())}
 
 
 @cache
@@ -548,7 +550,7 @@ def value_consumers(path, attribute, old, new):
         # tokenizer or parser. Unchanged dictionary expansions may be ignored.
         changed = [
             key for key, before, after in zip(old.keys, old.values, new.values)
-            if ast.dump(before) != ast.dump(after)
+            if not same_ast(before, after)
         ]
         if all(isinstance(key, ast.Constant) and isinstance(key.value, str) for key in changed):
             return tuple(f"{kind}/{key.value}" for key in changed)
@@ -569,6 +571,13 @@ def class_candidates(path, source, updated, mapping, by_file):
         if not roots - {COLLECTION}:
             return None
         keys = value_consumers(path, attribute, old, new)
+        if keys and keys[0].startswith("numeric-escape/") and "numeric-origin" in mapping["dictionary_lookups"]:
+            escapes = [key.split("/", 1)[1] for key in keys]
+            keys = tuple(
+                f"numeric-origin/{origin}/{escape}"
+                for origin in (f"{path}:{name}", "unknown")
+                for escape in escapes
+            )
         consumers = observed_on(mapping, keys)
         watched_dictionary = keys and keys[0].split("/", 1)[0] in mapping["dictionary_lookups"]
         direct_reads = (bool(consumers) or watched_dictionary) and COLLECTION not in consumers
@@ -583,7 +592,7 @@ def class_candidates(path, source, updated, mapping, by_file):
                 if test in readers
             }
         candidates.update(roots - {COLLECTION})
-        candidates.update(references_class(by_file, {outer, attribute}))
+        candidates.update(references_class(mapping, {outer, attribute}))
     return candidates
 
 
@@ -610,7 +619,7 @@ def module_constant_candidates(path, source, updated, mapping, by_file):
         ):
             old.value = new.value
             changed.append(name)
-    if not changed or ast.dump(before) != ast.dump(after):
+    if not changed or not same_ast(before, after):
         return None
     compile(updated, path, "exec")
     candidates = set()
@@ -626,11 +635,11 @@ def module_constant_candidates(path, source, updated, mapping, by_file):
         if not consumers or COLLECTION in consumers:
             return None
         candidates.update(consumers)
-        candidates.update(references_class(by_file, set(names)))
+        candidates.update(references_class(mapping, names))
     return candidates
 
 
-def signature_candidates(path, source, updated, mapping, by_file):
+def signature_candidates(path, source, updated, mapping):
     """Scope literal defaults changed in otherwise identical module functions."""
     original, patched = ast.parse(source), ast.parse(updated)
     affected = []
@@ -648,19 +657,19 @@ def signature_candidates(path, source, updated, mapping, by_file):
             for index, (before, after) in enumerate(zip(old_defaults, new_defaults)):
                 if (
                     before is not None and after is not None
-                    and ast.dump(before) != ast.dump(after)
+                    and not same_ast(before, after)
                     and literal_value(before) and literal_value(after)
                     and same_value_shape(before, after, original)
                 ):
                     old_defaults[index] = after
                     affected.append((old.name, old.lineno))
-    if not affected or ast.dump(original) != ast.dump(patched):
+    if not affected or not same_ast(original, patched):
         return None
     compile(updated, path, "exec")
     owners = observed_on(mapping, (f"{path}:{line}" for _, line in affected))
     if not owners or COLLECTION in owners:
         return None
-    owners.update(references_class(by_file, {name for name, _ in affected}))
+    owners.update(references_class(mapping, {name for name, _ in affected}))
     return owners
 
 
@@ -676,14 +685,14 @@ def candidate_tests(edits, mapping, by_file, all_ids):
         elif path.startswith("sqlglot/") and path.endswith(".py"):
             source, updated, removed, inserted = edit
             owners = set(mapping["source_reads"].get(path, ()))
-            if ast.dump(ast.parse(source)) != ast.dump(ast.parse(updated)):
+            if not same_ast(ast.parse(source), ast.parse(updated)):
                 keys = changed_functions(path, edit)
                 if keys is None:
                     class_owners = class_candidates(path, source, updated, mapping, by_file)
                     if class_owners is None:
                         class_owners = module_constant_candidates(path, source, updated, mapping, by_file)
                     if class_owners is None:
-                        class_owners = signature_candidates(path, source, updated, mapping, by_file)
+                        class_owners = signature_candidates(path, source, updated, mapping)
                     if class_owners is None:
                         return all_ids, ()
                     owners.update(class_owners)
@@ -727,7 +736,17 @@ def schedule(ids, tests):
 
 def patched_tree(scratch, edits):
     tree = scratch / "source"
-    shutil.copytree(BASE, tree, copy_function=os.symlink)
+    fixtures = BASE / "tests" / "fixtures"
+    unchanged_fixtures = fixtures.is_dir() and not any(
+        path.startswith("tests/fixtures/") for path in edits
+    )
+
+    def ignore(directory, names):
+        return {"fixtures"} if unchanged_fixtures and Path(directory) == fixtures.parent else set()
+
+    shutil.copytree(BASE, tree, copy_function=os.symlink, ignore=ignore)
+    if unchanged_fixtures:
+        (tree / "tests" / "fixtures").symlink_to(fixtures, target_is_directory=True)
     for path, (_, content, _, _) in edits.items():
         target = tree / path
         target.unlink()
@@ -806,6 +825,40 @@ def class_fixture_cost(path, class_name):
     )
 
 
+def quick_child(tree, request, response):
+    os.setsid()
+    os.chdir(tree)
+    os.environ["PYTHONPATH"] = str(tree)
+    sys.path.insert(0, str(tree))
+    with open(os.devnull, "r+b", buffering=0) as sink:
+        for fd in (0, 1, 2):
+            os.dup2(sink.fileno(), fd)
+        sys.exit(quick_unittest(request, response))
+
+
+def run_quick(tree, request, response, timeout):
+    # Share the already-loaded standard library. No SQLGlot modules are
+    # imported before the child switches to the patched checkout.
+    process = multiprocessing.get_context("fork").Process(
+        target=quick_child, args=(tree, request, response)
+    )
+    process.start()
+    try:
+        process.join(timeout)
+        if process.exitcode is None:
+            try:
+                if os.getpgid(process.pid) == process.pid:
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            process.join()
+        return process.exitcode
+    finally:
+        process.close()
+
+
 def confirm_unittest(edits, candidates, timeout):
     """Keep the static set unless every approved case ran to completion."""
     with tempfile.TemporaryDirectory(prefix="blast-") as scratch:
@@ -814,9 +867,7 @@ def confirm_unittest(edits, candidates, timeout):
         requested = scratch / "selected.json"
         response = scratch / "failed.json"
         requested.write_text(json.dumps(sorted(candidates)))
-        env = dict(os.environ, PYTHONPATH=str(tree))
-        cmd = [sys.executable, str(APP / "quick_unittest.py"), str(requested), str(response)]
-        if run_in_tree(cmd, tree, env, timeout) != 0 or not response.is_file():
+        if run_quick(tree, requested, response, timeout) != 0 or not response.is_file():
             return candidates
         failed = set(json.loads(response.read_text()))
         return failed if failed <= candidates else candidates
@@ -835,7 +886,7 @@ def main():
         by_file[test["file"]].add(test["id"])
     all_ids = set(tests)
     all_workers, all_cost = schedule(all_ids, tests)
-    mapping = json.loads((APP / "reachability.json").read_text())
+    mapping = load_coverage(APP / "reachability.json")
     healthy = not mapping["collection_errors"] and all_ids <= set(mapping["finished"])
     confirm_candidates = os.environ.get("BLAST_CONFIRM") == "1"
     quick_check = os.environ.get("BLAST_QUICK", "1") == "1"
