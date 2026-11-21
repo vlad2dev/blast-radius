@@ -92,13 +92,14 @@ def on_audit(event, args):
 if BUILD:
     from comparison_probe import install
     from default_probe import DefaultReads
+    from global_probe import GlobalReads
     defaults = DefaultReads(Path(__file__).with_name("default_sites.json"), lambda key: coverage[key].add(active_test))
     from sitecustomize import run_pool_task
 
     def record_lookup(key):
         coverage[key].add(active_test)
 
-    install(ROOT, identity_sites.add, record_lookup)
+    install(ROOT, identity_sites.add, record_lookup, GlobalReads(Path(__file__).with_name("global_sites.json"), record_lookup))
 
     submit = ProcessPoolExecutor.submit
 
@@ -243,6 +244,7 @@ def pytest_sessionfinish(session, exitstatus):
         CHILD_REPORTS.rmdir()
         owners = sorted(set().union(*coverage.values()))
         numbers = {owner: number for number, owner in enumerate(owners)}
+        data["scalar_globals"] = True
         data["argument_defaults"] = True
         data["owners"] = owners
         data["test_references"] = index_test_references()

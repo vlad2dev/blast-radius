@@ -40,6 +40,22 @@ class TestSourceScope(unittest.TestCase):
     def test_top_level_state_stays_broad(self):
         self.source+='GLOBAL_STATE = initialize()\n';(self.root/self.path).write_text(self.source)
         self.assertIsNone(self.select('import gold_contract_absent_463874\n'+self.source))
+    def test_pure_fixture_paths_and_standard_decorators(self):
+        self.source='import unittest\nimport os\nfrom unittest import mock\nclass TestScope(unittest.TestCase):\n    file_dir = os.path.dirname(__file__)\n    fixtures_dir = os.path.join(file_dir, "fixtures")\n    @mock.patch("target.name")\n    def test_value(self, mocked):\n        self.assertEqual(1, 1)\n'
+        (self.root/self.path).write_text(self.source)
+        self.assertEqual(self.select('import gold_contract_absent_463874\n'+self.source),self.ids)
+    def test_nested_decorator_calls_are_not_declarations(self):
+        self.source=self.source.replace('    def test_value', '    @unittest.skipIf(initialize(), "reason")\n    def test_value')
+        (self.root/self.path).write_text(self.source)
+        self.assertIsNone(self.select('import gold_contract_absent_463874\n'+self.source))
+    def test_annotation_calls_are_not_declarations(self):
+        self.source=self.source.replace('def test_value(self):','def test_value(self, value: initialize()):')
+        (self.root/self.path).write_text(self.source)
+        self.assertIsNone(self.select('import gold_contract_absent_463874\n'+self.source))
+    def test_class_definition_cannot_write_external_state(self):
+        self.source=self.source.replace('class TestScope(unittest.TestCase):','class TestScope(unittest.TestCase):\n    external.value = 1')
+        (self.root/self.path).write_text(self.source)
+        self.assertIsNone(self.select('import gold_contract_absent_463874\n'+self.source))
     def test_custom_metaclass_stays_broad(self):
         self.source=self.source.replace('unittest.TestCase','CustomBase');(self.root/self.path).write_text(self.source)
         self.assertIsNone(self.select('import gold_contract_absent_463874\n'+self.source))

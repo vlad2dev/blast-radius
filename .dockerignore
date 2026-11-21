@@ -10,3 +10,5 @@
 !coverage_index.py
 
 !default_probe.py
+
+!global_probe.py

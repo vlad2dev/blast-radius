@@ -69,7 +69,7 @@ def comparison_agrees_with_identity(left, right):
     return False
 
 
-def install(root, record, record_lookup):
+def install(root, record, record_lookup, global_reads=None):
     source_root = str(root) + "/sqlglot/"
     original_loader = importlib.machinery.SourceFileLoader.get_code
 
@@ -231,14 +231,21 @@ def install(root, record, record_lookup):
 
     def get_code(loader, fullname):
         filename = loader.get_filename(fullname)
-        if filename.startswith(source_root):
+        source_file = filename.startswith(source_root)
+        target_file = source_file or (global_reads is not None and filename.startswith(str(root) + "/tests/"))
+        if target_file:
             source = loader.get_data(filename)
-            if any(token in source for token in (b" is ", b"<", b">", b"NUMERIC_ESCAPES")):
-                transform = Observe(filename[len(str(root)) + 1 :])
-                tree = transform.visit(ast.parse(source, filename=filename))
-                if transform.changed:
-                    ast.fix_missing_locations(tree)
-                    return compile(tree, filename, "exec", dont_inherit=True)
+            transform = Observe(filename[len(str(root)) + 1 :])
+            tree = ast.parse(source, filename=filename)
+            if source_file:
+                tree = transform.visit(tree)
+            changed = transform.changed
+            if global_reads is not None:
+                tree, observed = global_reads.transform(filename[len(str(root)) + 1 :], tree)
+                changed = changed or observed
+            if changed:
+                ast.fix_missing_locations(tree)
+                return compile(tree, filename, "exec", dont_inherit=True)
         return original_loader(loader, fullname)
 
     importlib.machinery.SourceFileLoader.get_code = get_code

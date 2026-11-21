@@ -12,6 +12,7 @@ owner = os.environ.get("BLAST_ACTIVE_TEST")
 if owner:
     from comparison_probe import install
     from default_probe import DefaultReads
+    from global_probe import GlobalReads
     from receiver_probes import RECEIVER_METHODS, receivers
 
     root = os.environ["BLAST_SOURCE"]
@@ -71,7 +72,7 @@ if owner:
     def record_lookup(key):
         entered[owner].add(key)
 
-    install(Path(root), identity_sites.add, record_lookup)
+    install(Path(root), identity_sites.add, record_lookup, GlobalReads(Path(__file__).with_name("global_sites.json"), record_lookup))
     monitor.use_tool_id(tool, "blast-radius child reachability")
     monitor.register_callback(tool, monitor.events.PY_START, on_enter)
     monitor.register_callback(tool, monitor.events.PY_RESUME, on_resume)

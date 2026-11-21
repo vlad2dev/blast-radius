@@ -22,6 +22,7 @@ from types import CodeType
 from comparison_probe import identity_site, order_site
 from coverage_index import load as load_coverage
 from quick_unittest import main as quick_unittest
+from global_probe import sites as global_sites, module_name as global_module
 
 DATA = Path("/data")
 APP = Path(__file__).resolve().parent
@@ -809,8 +810,42 @@ def literal_value(node):
     return True
 
 
+def global_binding_candidates(path, source, updated, mapping):
+    if not mapping.get("scalar_globals"):
+        return None
+    before, after = ast.parse(source), ast.parse(updated)
+    changed = []
+    for old, new in zip(before.body, after.body):
+        name = attribute_name(old)
+        if (name and name.isupper() and name == attribute_name(new)
+            and literal_value(old.value) and literal_value(new.value)
+            and not same_ast(old.value, new.value) and same_value_shape(old.value, new.value, before)):
+            old.value = new.value
+            changed.append(name)
+    if not changed or not same_ast(before, after):
+        return None
+    compile(updated, path, "exec")
+    keys = set()
+    for name in changed:
+        sites = global_sites(APP / "global_sites.json", global_module(path), name)
+        if sites is None:
+            return None
+        keys.update(sites)
+    owners = observed_on(mapping, keys)
+    if COLLECTION in owners:
+        return None
+    owners.update(references_class(mapping, set(changed) | {
+        "getmembers", "getmembers_static", "signature", "getattr", "vars", "dir",
+        "__dict__", "__globals__", "eval", "exec", "globals", "locals",
+    }))
+    return owners
+
+
 def module_constant_candidates(path, source, updated, mapping, by_file):
     """Trace literal globals through reads, import aliases, and captured defaults."""
+    precise = global_binding_candidates(path, source, updated, mapping)
+    if precise is not None:
+        return precise
     before = ast.parse(source)
     after = ast.parse(updated)
     changed = []
@@ -950,25 +985,61 @@ def isolated_test_module(path):
             if other != target and stem.search(other.read_bytes()):
                 return False
     tree = module_syntax(path)
+    os_imported = any(isinstance(n, ast.Import) and any(a.name in {"os", "os.path"} and (a.asname or a.name.split(".")[0]) == "os" for a in n.names) for n in tree.body)
+
+    unittest_imported = any(isinstance(n, ast.Import) and any(a.name == "unittest" and (a.asname or a.name) == "unittest" for a in n.names) for n in tree.body)
+    mock_imported = any(isinstance(n, ast.ImportFrom) and n.module == "unittest" and any(a.name == "mock" and (a.asname or a.name) == "mock" for a in n.names) for n in tree.body)
+
+    def passive_function(node):
+        for decorator in node.decorator_list:
+            name = decorator.func if isinstance(decorator, ast.Call) else decorator
+            qualified = ast.unparse(name)
+            if qualified.startswith("unittest.") and not unittest_imported:
+                return False
+            if qualified.startswith("mock.") and not mock_imported:
+                return False
+            if isinstance(decorator, ast.Call) and any(isinstance(child, ast.Call) for expression in [*decorator.args, *[k.value for k in decorator.keywords]] for child in ast.walk(expression)):
+                return False
+            if qualified not in {
+                "classmethod", "staticmethod", "unittest.skip", "unittest.skipIf", "unittest.skipUnless",
+                "mock.patch", "mock.patch.object", "mock.patch.dict",
+                "unittest.mock.patch", "unittest.mock.patch.object", "unittest.mock.patch.dict",
+            }:
+                return False
+        annotations = [a.annotation for a in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs) if a.annotation is not None]
+        if node.returns is not None:
+            annotations.append(node.returns)
+        if any(isinstance(child, ast.Call) for annotation in annotations for child in ast.walk(annotation)):
+            return False
+        return all(literal_value(x) for x in (*node.args.defaults, *filter(None, node.args.kw_defaults)))
+
     for node in tree.body:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             continue
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
             continue
-        if isinstance(node, ast.FunctionDef) and not node.decorator_list:
-            if any(not literal_value(x) for x in (*node.args.defaults, *filter(None, node.args.kw_defaults))):
+        if isinstance(node, ast.FunctionDef):
+            if not passive_function(node):
                 return False
             continue
         if not isinstance(node, ast.ClassDef) or node.decorator_list or node.keywords:
             return False
         if len(node.bases) != 1 or ast.unparse(node.bases[0]) != "unittest.TestCase":
             return False
+        paths = {"__file__"}
         for child in node.body:
-            if isinstance(child, ast.FunctionDef) and not child.decorator_list:
-                if all(literal_value(x) for x in (*child.args.defaults, *filter(None, child.args.kw_defaults))):
-                    continue
-            if isinstance(child, ast.Assign) and literal_value(child.value):
+            if isinstance(child, ast.FunctionDef) and passive_function(child):
                 continue
+            if isinstance(child, ast.Assign) and all(isinstance(t, ast.Name) for t in child.targets):
+                if literal_value(child.value):
+                    paths.update(t.id for t in child.targets if isinstance(ast.literal_eval(child.value), str))
+                    continue
+                value = child.value
+                if (os_imported and isinstance(value, ast.Call) and not value.keywords
+                    and ast.unparse(value.func) in {"os.path.dirname", "os.path.join"}
+                    and all(isinstance(a, ast.Constant) and isinstance(a.value, str) or isinstance(a, ast.Name) and a.id in paths for a in value.args)):
+                    paths.update(t.id for t in child.targets)
+                    continue
             if isinstance(child, ast.Expr) and isinstance(child.value, ast.Constant):
                 continue
             return False

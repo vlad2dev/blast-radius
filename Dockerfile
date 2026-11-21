@@ -4,8 +4,8 @@ ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/sqlglot PYTHON_
 COPY requirements.lock /app/requirements.lock
 RUN pip install --no-cache-dir -r /app/requirements.lock
 RUN python -c "import tarfile, urllib.request; from pathlib import Path; p = Path('/opt/sqlglot'); p.mkdir(); url = 'https://codeload.github.com/tobymao/sqlglot/tar.gz/eb11aec4be8cb2122afe713a4816662c3f0fb2fa'; r = urllib.request.urlopen(url, timeout=60); t = tarfile.open(fileobj=r, mode='r|gz'); t.extractall(p, filter='data'); next(p.iterdir()).rename('/opt/sqlglot-source'); p.rmdir(); Path('/opt/sqlglot-source').rename(p)"
-COPY test_observer.py sitecustomize.py receiver_probes.py comparison_probe.py default_probe.py /app/
-RUN python /app/default_probe.py /opt/sqlglot /app/default_sites.json
+COPY test_observer.py sitecustomize.py receiver_probes.py comparison_probe.py default_probe.py global_probe.py /app/
+RUN python /app/default_probe.py /opt/sqlglot /app/default_sites.json && python /app/global_probe.py /opt/sqlglot /app/global_sites.json
 RUN cd /opt/sqlglot && PYTHON_CPU_COUNT=4 OPENBLAS_NUM_THREADS=1 BLAST_COLLECT=1 BLAST_RESULT=/app/reachability.json \
     PYTHONPATH=/app:/opt/sqlglot python -m pytest -q -p no:cacheprovider \
     -p test_observer tests
