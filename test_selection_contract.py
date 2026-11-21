@@ -66,6 +66,12 @@ class ClassConfiguration(unittest.TestCase):
             with self.subTest(before=before):
                 changes=s.class_changes('sqlglot/dialects/example.py',('class Example:\n    '+before+'\n').encode(),('class Example:\n    '+after+'\n').encode())
                 self.assertEqual(len(changes),1)
+    def test_root_metaclass_defaults_are_not_scoped_to_instance_readers(self):
+        for header in ['class Example(metaclass=Meta):', 'class Example(type):']:
+            before=(header+'\n    FLAG = False\n').encode()
+            after=before.replace(b'False',b'True')
+            with self.subTest(header=header):
+                self.assertIsNone(s.class_candidates('sqlglot/example.py',before,after,{},{}))
     def test_calls_are_not_passive_literals(self):
         before=b'class Example:\n    QUOTES = ["a"]\n'
         self.assertFalse(s.class_changes('sqlglot/dialects/example.py',before,b'class Example:\n    QUOTES = initialize()\n'))

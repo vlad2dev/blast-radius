@@ -752,6 +752,15 @@ def class_candidates(path, source, updated, mapping, by_file):
     changes = class_changes(path, source, updated)
     if not changes:
         return None
+    # Root metaclasses may consume defaults while building cached subclasses,
+    # before any instance or ordinary attribute reader is observed.
+    tree = ast.parse(source)
+    roots = {name.split(".")[0] for name, _, _, _ in changes}
+    if any(isinstance(node, ast.ClassDef) and node.name in roots and (
+        any(keyword.arg == "metaclass" for keyword in node.keywords)
+        or any(isinstance(base, ast.Name) and base.id == "type" for base in node.bases)
+    ) for node in tree.body):
+        return None
     compile(updated, path, "exec")
     module = path.removesuffix(".py").replace("/", ".")
     candidates = set()
