@@ -248,3 +248,54 @@ Push to a public GitHub repository with the `Dockerfile` at its top, then enter 
 - `requirements.lock` is every package in the environment we labeled in, on the image the `Dockerfile` starts from. To run sqlglot's tests the way we did, `pip install -r requirements.lock` and put the sqlglot checkout on `PYTHONPATH`; sqlglot's own `pip install -e .[dev]` picks newer versions.
 - The scorer is linux/amd64. On an Apple Silicon Mac, build and run with `--platform linux/amd64`, as the Makefile does, or your timings and wheels will differ.
 - A change that only adds a comment is not promised to be harmless.
+
+## Dependency review experiment (2026-11-20)
+
+Continues the previous session's uncommitted registry-graph candidate, preserved
+as commit 6caad6c on experiment/dependency-review. No publication or submission.
+
+Hypothesis: resolving relative imports, qualified module imports and simple local
+aliases prevents copied registries from escaping the dependency graph. Wildcard
+imports from relevant modules retain full-suite fallback. This is a correctness
+experiment, not a claimed leaderboard improvement.
+
+Compared general-purpose public projects, without incorporating competing team
+code:
+- https://github.com/tarpas/pytest-testmon collects executed-code dependencies;
+  its coverage-based selection supports our baseline-first approach. Our existing
+  selector adds contest-specific registry consumers, fixture/source reads, pool
+  task ownership, and explicit scheduling under the worker penalty.
+- https://github.com/anapaulagomes/pytest-picked selects tests related to files
+  changed according to Git. File-level selection is useful as a coarse baseline;
+  the contest requires finer dependency tracking and independent patch handling.
+- Rules: https://www.joinbuilders.org/buildathon/tracks/blast-radius prohibit
+  code sharing between teams. No competing implementation was imported.
+
+Fixed inputs: official 30-patch sample, 18 previously full-suite-labeled synthetic
+patches, and independent source fixtures in test_registry_dependencies.py. No
+random generation, hidden inputs, or patch-answer lookup in the selector.
+
+Evidence: all 30 sample and 18 synthetic patches have zero misses. Three serial
+sample runs produce identical output (SHA256
+bc900fca0ea403bb23eb0dadc711d033c4f0ee25c8a63af0c055ea07e9bcb3b1).
+Simulated seconds remain 97.098. Median cgroup CPU is 4.390 seconds, estimated
+local total 101.5. Same-session baseline CPU median is 4.076 seconds, total 101.2;
+this safety expansion costs about 0.3 CPU seconds on the sample. These are local
+estimates, not practice board scores. New unit fixtures pass four test methods
+with seven import-form subcases. The prior implementation fails eight fixture
+assertions. The cached Docker build succeeds; a run of the actual new image
+without selector mounts also yields 97.098 seconds and zero misses.
+
+Reproduce fixture checks:
+`python -m unittest discover -s . -p test_registry_dependencies.py -v`
+
+Runs used the official isolation flags (network disabled, 2 CPUs, 4 GB RAM,
+read-only filesystem, 64 MB tmpfs, UID 65534, 256 processes). Detailed results
+remain local in verification-results.json, baseline-results.json and
+image-results.json. Existing labeling oracles were reused, not regenerated.
+The tooling workspace's seven unit tests and smoke experiment also pass.
+
+Stop condition met: source fixtures pass; sample and existing synthetic recall
+remain unchanged; cached image runs successfully. No speed improvement claimed.
+Unknown alias/reflection patterns still need further conservative analysis; the
+new fixtures demonstrate dependency resolution, not a proof of complete recall.

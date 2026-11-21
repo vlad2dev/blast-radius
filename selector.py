@@ -651,16 +651,47 @@ def registry_dependents(path, outer, attribute):
         seen.add((origin, exported))
         for candidate, contents in project_source_files():
             module = candidate.removesuffix(".py").replace("/", ".")
-            if module == origin or attribute.encode() not in contents or exported.encode() not in contents:
+            if module == origin or attribute.encode() not in contents:
                 continue
             tree = module_syntax(candidate)
-            aliases = {
-                name.asname or name.name
-                for statement in ast.walk(tree)
-                if isinstance(statement, ast.ImportFrom) and statement.level == 0
-                and statement.module in {origin, origin.rsplit(".", 1)[0]}
-                for name in statement.names if name.name == exported
-            }
+            aliases = set()
+            for statement in ast.walk(tree):
+                if isinstance(statement, ast.Import):
+                    for name in statement.names:
+                        if name.name == origin:
+                            aliases.add(name.asname or name.name.split(".")[0])
+                elif isinstance(statement, ast.ImportFrom):
+                    imported = statement.module or ""
+                    if statement.level:
+                        package = module.split(".")[:-1]
+                        if statement.level > len(package):
+                            return None
+                        imported = ".".join(package[:len(package) - statement.level + 1] + ([imported] if imported else []))
+                    for name in statement.names:
+                        if name.name == "*" and imported in {origin, origin.rsplit(".", 1)[0]}:
+                            return None
+                        if (
+                            imported in {origin, origin.rsplit(".", 1)[0]} and name.name == exported
+                            or imported + "." + name.name == origin
+                        ):
+                            aliases.add(name.asname or name.name)
+            # Local rebinding can carry the imported registry into another
+            # class. Follow simple aliases; ambiguous assignments stay broad.
+            progress = True
+            while progress:
+                progress = False
+                for statement in ast.walk(tree):
+                    if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                        continue
+                    value = statement.value
+                    while isinstance(value, ast.Attribute):
+                        value = value.value
+                    if isinstance(value, ast.Name) and value.id in aliases:
+                        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                        for target in targets:
+                            if isinstance(target, ast.Name) and target.id not in aliases:
+                                aliases.add(target.id)
+                                progress = True
             if not aliases:
                 continue
             for node in ast.walk(tree):
