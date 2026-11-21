@@ -852,6 +852,17 @@ def global_binding_candidates(path, source, updated, mapping):
 
 def module_constant_candidates(path, source, updated, mapping, by_file):
     """Trace literal globals through reads, import aliases, and captured defaults."""
+    # Definition hooks can cache the effect in other classes without another
+    # read of the original binding. Until those writes are modeled, stay broad.
+    declarations = ast.parse(source)
+    if any(
+        isinstance(node, ast.ClassDef) and (
+            any(keyword.arg == "metaclass" for keyword in node.keywords)
+            or any(isinstance(base, ast.Name) and base.id == "type" for base in node.bases)
+        ) or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "__init_subclass__"
+        for node in ast.walk(declarations)
+    ):
+        return None
     precise = global_binding_candidates(path, source, updated, mapping)
     if precise is not None:
         return precise

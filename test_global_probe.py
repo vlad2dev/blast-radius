@@ -51,6 +51,11 @@ class BindingSelection(unittest.TestCase):
         mapping={'scalar_globals':True,'owners':['@collection','test_one','test_two'],'coverage':{'global/sqlglot.example:VALUE':reads,'global-escape/sqlglot.example':escaped},'test_references':refs or {}}
         with patch.object(s,'global_sites',return_value=('global/sqlglot.example:VALUE','global-escape/sqlglot.example')):
             return s.global_binding_candidates('sqlglot/example.py',b'VALUE = "v"\n',b'VALUE = "q"\n',mapping)
+    def test_definition_hooks_keep_module_constants_broad(self):
+        for definition in ['class Meta(type):\n    pass\n', 'class Model(metaclass=Meta):\n    pass\n', 'class Model:\n    def __init_subclass__(cls):\n        pass\n']:
+            before=('VALUE = "v"\n'+definition).encode();after=before.replace(b'"v"',b'"q"')
+            with self.subTest(definition=definition):
+                self.assertIsNone(s.module_constant_candidates('sqlglot/example.py',before,after,{},{}))
     def test_only_actual_binding_readers_selected(self):self.assertEqual(self.select(),{'test_one'})
     def test_collection_reads_stay_broad(self):self.assertIsNone(self.select((0,1)))
     def test_collection_namespace_escape_stays_broad(self):self.assertIsNone(self.select(escaped=(0,)))
