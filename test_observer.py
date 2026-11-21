@@ -83,7 +83,10 @@ if BUILD:
     from comparison_probe import install
     from sitecustomize import run_pool_task
 
-    install(ROOT, identity_sites.add)
+    def record_lookup(key):
+        coverage[key].add(active_test)
+
+    install(ROOT, identity_sites.add, record_lookup)
 
     submit = ProcessPoolExecutor.submit
 
@@ -187,6 +190,10 @@ def pytest_sessionfinish(session, exitstatus):
         owners = sorted(set().union(*coverage.values()))
         numbers = {owner: number for number, owner in enumerate(owners)}
         data["owners"] = owners
+        data["dictionary_lookups"] = [
+            kind for kind in ("numeric-escape", "keyword", "parser-rule")
+            if any(key.startswith(kind + "/") for key in coverage)
+        ]
         # This table describes observed operand semantics at source locations.
         # It contains no test identities or outcomes from patched executions.
         data["proven_comparisons"] = {

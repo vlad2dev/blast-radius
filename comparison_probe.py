@@ -1,4 +1,4 @@
-"""Observe the operand types of identity comparisons in the pinned source."""
+"""Observe comparisons and tokenizer dictionary reads in the pinned source."""
 
 import ast
 import builtins
@@ -69,7 +69,7 @@ def comparison_agrees_with_identity(left, right):
     return False
 
 
-def install(root, record):
+def install(root, record, record_lookup):
     source_root = str(root) + "/sqlglot/"
     original_loader = importlib.machinery.SourceFileLoader.get_code
 
@@ -85,12 +85,65 @@ def install(root, record):
             record(key + "/unproven")
         return (left is not right) if operation == "IsNot" else (left is right)
 
+    def lookup(kind, table, key, *default):
+        if isinstance(key, str):
+            record_lookup(f"{kind}/{key}")
+        return table.get(key, *default)
+
+    def lookup_item(kind, table, key):
+        if isinstance(key, str):
+            record_lookup(f"{kind}/{key}")
+        return table[key]
+
     setattr(builtins, PROBE, observe)
+    builtins._blast_observe_lookup = lookup
+    builtins._blast_observe_item = lookup_item
 
     class Observe(ast.NodeTransformer):
         def __init__(self, path):
             self.path = path
             self.changed = False
+
+        def dictionary_kind(self, node):
+            name = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
+            if self.path == "sqlglot/tokenizer_core.py":
+                return {"numeric_escapes": "numeric-escape", "keywords": "keyword"}.get(name)
+            if self.path == "sqlglot/parser.py" and isinstance(node, ast.Name) and name == "parsers":
+                return "parser-rule"
+            return None
+
+        def visit_Call(self, node):
+            node = self.generic_visit(node)
+            if (
+                isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+                and (kind := self.dictionary_kind(node.func.value))
+                and len(node.args) in (1, 2) and not node.keywords
+                and not any(isinstance(arg, ast.Starred) for arg in node.args)
+            ):
+                self.changed = True
+                return ast.copy_location(
+                    ast.Call(
+                        func=ast.Name(id="_blast_observe_lookup", ctx=ast.Load()),
+                        args=[ast.Constant(kind), node.func.value, *node.args],
+                        keywords=[],
+                    ),
+                    node,
+                )
+            return node
+
+        def visit_Subscript(self, node):
+            node = self.generic_visit(node)
+            if isinstance(node.ctx, ast.Load) and (kind := self.dictionary_kind(node.value)):
+                self.changed = True
+                return ast.copy_location(
+                    ast.Call(
+                        func=ast.Name(id="_blast_observe_item", ctx=ast.Load()),
+                        args=[ast.Constant(kind), node.value, node.slice],
+                        keywords=[],
+                    ),
+                    node,
+                )
+            return node
 
         def visit_Compare(self, node):
             node = self.generic_visit(node)

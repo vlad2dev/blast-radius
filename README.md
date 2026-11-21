@@ -145,6 +145,35 @@ The previous official/local ratio would project roughly 246 seconds for
 this candidate. It is a one-run planning reference. An official run on the
 private scoring batch is required to determine the actual result.
 
+## Challenger experiment
+
+This version follows where configuration values can first affect an execution.
+It joins static binding information with baseline coverage, following imported
+aliases and mapping captured defaults to calls of the affected function.
+The tokenizer and parser probes record dictionary reads by key, so changing
+an existing keyword or dispatch entry can be scoped to its observed consumers.
+Changes with uncertain dependencies retain the wider selector. The maps contain
+baseline observations and are generated without patch labels.
+
+This combines the changed-execution principle from
+[Safe Regression Test Selection](https://www.cs.purdue.edu/homes/xyzhang/spring07/Papers/p173-rothermel.pdf)
+with finer dependency tracking from
+[Ekstazi](https://users.ece.utexas.edu/~gligoric/papers/GligoricETAL15Ekstazi.pdf)
+and the semantic checks described in
+[FineRTS](https://www.cs.cornell.edu/~legunsen/pubs/LiuETAL23FineRTS.pdf).
+
+Three sample runs produced identical output with zero misses, 107.737
+simulated seconds, and median 2.928 container CPU seconds. The local
+estimate was 110.7 seconds. The independently labeled Snowflake keyword
+mutation fell from 36.817 simulated seconds on the near-floor version to
+2.164 seconds. Targeted pytest confirmation cost more CPU than it saved
+in scoring, so it remains disabled by default.
+
+Thirteen independently labeled synthetic patches had zero misses. One
+captured-default mutation broke nine tests and retained the full suite
+because the baseline probe recorded a collection-time call. This is an
+unresolved source of overhead on batches with import-time dependencies.
+
 ## Submit
 
 Push to a public GitHub repository with the `Dockerfile` at its top, then enter the repository and the commit hash on the track page. The final scores the commit you pick. If you pick none, your best practice submission counts.

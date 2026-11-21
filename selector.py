@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import re
+import resource
 import shutil
 import signal
 import subprocess
@@ -283,6 +284,29 @@ def creates_closure(name, tree):
     return False
 
 
+def resolves_enum(name, tree, depth=0):
+    if depth >= 8:
+        return False
+    for node in reversed(tree.body):
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            return any(
+                isinstance(base, ast.Name) and resolves_enum(base.id, tree, depth + 1)
+                for base in node.bases
+            )
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            for alias in node.names:
+                if (alias.asname or alias.name) != name:
+                    continue
+                if node.module == "enum":
+                    return alias.name in {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"}
+                if node.module.startswith("sqlglot."):
+                    path = node.module.replace(".", "/") + ".py"
+                    if (BASE / path).is_file():
+                        return resolves_enum(alias.name, module_syntax(path), depth + 1)
+                return False
+    return False
+
+
 def same_value_shape(old, new, tree):
     """Allow value-only changes while preserving keys, types, and call binding."""
     if ast.dump(old) == ast.dump(new):
@@ -291,6 +315,11 @@ def same_value_shape(old, new, tree):
         return False
     if isinstance(old, ast.Constant):
         return type(old.value) is type(new.value)
+    if isinstance(old, ast.Attribute):
+        return (
+            isinstance(old.value, ast.Name) and isinstance(new.value, ast.Name)
+            and old.value.id == new.value.id and resolves_enum(old.value.id, tree)
+        )
     if isinstance(old, ast.UnaryOp):
         return type(old.op) is type(new.op) and same_value_shape(old.operand, new.operand, tree)
     if isinstance(old, (ast.Tuple, ast.List)):
@@ -369,27 +398,72 @@ def references_class(by_file, names):
 
 
 @cache
-def scalar_consumers(attribute, bare_names=False):
-    """Find direct class-value reads; decline narrowing on an indirect reference."""
-    paths = sorted((BASE / "sqlglot").rglob("*.py"))
+def project_source_files():
+    return tuple(
+        (path.relative_to(BASE).as_posix(), path.read_bytes())
+        for path in sorted((BASE / "sqlglot").rglob("*.py"))
+    )
+
+
+@cache
+def binding_consumers(attribute, bare_names=False):
+    """Map configuration reads to lines, or calls for captured defaults."""
+    symbols = {attribute}
+    files = project_source_files()
+    if bare_names:
+        while True:
+            renamed = set()
+            encoded = tuple(name.encode() for name in symbols)
+            for path, source in files:
+                if not any(name in source for name in encoded):
+                    continue
+                for node in ast.walk(module_syntax(path)):
+                    if isinstance(node, ast.ImportFrom) and all(alias.name != "*" for alias in node.names):
+                        renamed.update(
+                            alias.asname for alias in node.names
+                            if alias.name in symbols and alias.asname
+                        )
+            if renamed <= symbols:
+                break
+            symbols.update(renamed)
+            if len(symbols) > 12:
+                return (), ()
+
+    encoded = tuple(name.encode() for name in symbols)
     keys = set()
-    encoded = attribute.encode()
-    for path in paths:
-        if encoded not in path.read_bytes():
+    names = set(symbols)
+    for path, source in files:
+        if not any(name in source for name in encoded):
             continue
-        relative = path.relative_to(BASE).as_posix()
-        for node in ast.walk(module_syntax(relative)):
-            if isinstance(node, ast.Name) and node.id == attribute and isinstance(node.ctx, ast.Load):
+        tree = module_syntax(path)
+        default_owner = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defaults = [*node.args.defaults, *(v for v in node.args.kw_defaults if v is not None)]
+                for expression in defaults:
+                    default_owner.update((child, node) for child in ast.walk(expression))
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in symbols:
+                return (), ()
+            if isinstance(node, ast.Name) and node.id in symbols and isinstance(node.ctx, ast.Load):
                 if not bare_names:
-                    return ()
-                keys.update(f"{relative}#{line}" for line in range(node.lineno, node.end_lineno + 1))
-            if isinstance(node, ast.alias) and node.name == attribute and node.asname not in (None, attribute):
-                return ()
-            if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value == attribute:
-                return ()
-            if isinstance(node, ast.Attribute) and node.attr == attribute and isinstance(node.ctx, ast.Load):
-                keys.update(f"{relative}#{line}" for line in range(node.lineno, node.end_lineno + 1))
-    return tuple(sorted(keys))
+                    return (), ()
+            elif not (
+                isinstance(node, ast.Attribute) and node.attr in symbols and isinstance(node.ctx, ast.Load)
+            ):
+                continue
+            owner = default_owner.get(node)
+            if owner is None:
+                keys.update(f"{path}#{line}" for line in range(node.lineno, node.end_lineno + 1))
+                continue
+            if owner.decorator_list:
+                # Decorators can inspect or execute the function at definition
+                # time. Retain the broader fallback for these bindings.
+                return (), ()
+            keys.add(f"{path}:{owner.lineno}")
+            names.add(owner.name)
+    return tuple(sorted(keys)), tuple(sorted(names))
 
 
 def scalar_literal(node):
@@ -401,20 +475,23 @@ def scalar_literal(node):
 
 def value_consumers(path, attribute, old, new):
     if scalar_literal(old) and scalar_literal(new):
-        return scalar_consumers(attribute)
-    if (
-        path.startswith("sqlglot/dialects/") and attribute == "NUMERIC_ESCAPES"
-        and isinstance(old, ast.Dict) and isinstance(new, ast.Dict)
-    ):
-        # The pinned dialect metaclass and generator inspect key presence or
-        # truthiness, already preserved by same_value_shape. Only the tokenizer
-        # reads the dictionary values handed through its constructor.
-        tokenizer = "sqlglot/tokenizer_core.py"
-        methods = {"_read_byte_escape", "_scan_numeric_escape"}
-        return tuple(
-            f"{tokenizer}:{node.lineno}" for node in ast.walk(module_syntax(tokenizer))
-            if isinstance(node, ast.FunctionDef) and node.name in methods
-        )
+        return binding_consumers(attribute)[0]
+    kind = None
+    if path.startswith("sqlglot/dialects/"):
+        kind = {"NUMERIC_ESCAPES": "numeric-escape", "KEYWORDS": "keyword"}.get(attribute)
+    if path.startswith("sqlglot/parsers/") and attribute == "SHOW_PARSERS":
+        kind = "parser-rule"
+    if kind and isinstance(old, ast.Dict) and isinstance(new, ast.Dict):
+        # Equal key sets preserve truth, membership, and generated tries.
+        # Other reads in the pinned implementation go through the instrumented
+        # tokenizer or parser. Unchanged dictionary expansions may be ignored.
+        changed = [
+            key for key, before, after in zip(old.keys, old.values, new.values)
+            if ast.dump(before) != ast.dump(after)
+        ]
+        if all(isinstance(key, ast.Constant) and isinstance(key.value, str) for key in changed):
+            return tuple(f"{kind}/{key.value}" for key in changed)
+
     return ()
 
 
@@ -430,8 +507,10 @@ def class_candidates(path, source, updated, mapping, by_file):
         roots = observed_on(mapping, {f"receiver/{module}:{name}", f"receiver/{module}:{outer}"})
         if not roots - {COLLECTION}:
             return None
-        consumers = observed_on(mapping, value_consumers(path, attribute, old, new))
-        direct_reads = bool(consumers) and COLLECTION not in consumers
+        keys = value_consumers(path, attribute, old, new)
+        consumers = observed_on(mapping, keys)
+        watched_dictionary = keys and keys[0].split("/", 1)[0] in mapping["dictionary_lookups"]
+        direct_reads = (bool(consumers) or watched_dictionary) and COLLECTION not in consumers
         if path.count("/") == 1 and not direct_reads:
             return None
         if direct_reads:
@@ -447,8 +526,16 @@ def class_candidates(path, source, updated, mapping, by_file):
     return candidates
 
 
+def literal_value(node):
+    try:
+        ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError):
+        return False
+    return True
+
+
 def module_constant_candidates(path, source, updated, mapping, by_file):
-    """Narrow changes to scalar globals read directly outside collection."""
+    """Trace literal globals through reads, import aliases, and captured defaults."""
     before = ast.parse(source)
     after = ast.parse(updated)
     changed = []
@@ -456,7 +543,7 @@ def module_constant_candidates(path, source, updated, mapping, by_file):
         name = attribute_name(old)
         if (
             name and name.isupper() and name == attribute_name(new)
-            and scalar_literal(old.value) and scalar_literal(new.value)
+            and literal_value(old.value) and literal_value(new.value)
             and ast.dump(old.value) != ast.dump(new.value)
             and same_value_shape(old.value, new.value, before)
         ):
@@ -467,11 +554,12 @@ def module_constant_candidates(path, source, updated, mapping, by_file):
     compile(updated, path, "exec")
     candidates = set()
     for name in changed:
-        consumers = observed_on(mapping, scalar_consumers(name, bare_names=True))
+        keys, names = binding_consumers(name, bare_names=True)
+        consumers = observed_on(mapping, keys)
         if not consumers or COLLECTION in consumers:
             return None
         candidates.update(consumers)
-        candidates.update(references_class(by_file, {name}))
+        candidates.update(references_class(by_file, set(names)))
     return candidates
 
 
@@ -584,7 +672,8 @@ def confirm(edits, candidates, all_ids, by_file, timeout):
         )
         command = [
             sys.executable, "-m", "pytest", "-q", "--tb=no", "-p", "no:cacheprovider",
-            "-p", "test_observer", "--continue-on-collection-errors", "tests",
+            "-p", "test_observer", "--continue-on-collection-errors",
+            *sorted({test.split("::", 1)[0] for test in candidates}),
         ]
         exit_code = run_in_tree(command, tree, env, timeout)
         if exit_code not in (0, 1, 5) or not result.is_file():
@@ -600,6 +689,11 @@ def confirm(edits, candidates, all_ids, by_file, timeout):
         return (failures | (candidates - set(data["finished"]))) & all_ids
 
 
+def cpu_seconds():
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return time.process_time() + children.ru_utime + children.ru_stime
+
+
 def main():
     tests = {}
     by_file = defaultdict(set)
@@ -612,6 +706,7 @@ def main():
     healthy = not mapping["collection_errors"] and all_ids <= set(mapping["finished"])
     confirm_candidates = os.environ.get("BLAST_CONFIRM") == "1"
     deadline = time.monotonic() + 145
+    confirmation_credit = 3.0
     for patch in sorted((DATA / "commits").glob("*.patch")):
         workers, cost = all_workers, all_cost
         if healthy:
@@ -626,15 +721,23 @@ def main():
             except (OSError, ValueError, SyntaxError, RecursionError, subprocess.TimeoutExpired):
                 candidates = all_ids
                 edits = None
-            if confirm_candidates and edits and 1 < len(candidates) < len(all_ids):
-                estimate = 1.1 + 0.65 * sum(tests[nodeid][1] for nodeid in candidates) / 1000
-                timeout = min(12, 2 * estimate + 1, deadline - time.monotonic())
-                if cost / 1000 > estimate + 1 and timeout > estimate:
+            if (
+                confirm_candidates and confirmation_credit > 0.5
+                and edits and 0 < len(candidates) < len(all_ids)
+                and all(path.startswith("sqlglot/") and path.endswith(".py") for path in edits)
+            ):
+                total = sum(tests[nodeid][1] for nodeid in candidates) / 1000
+                files = {nodeid.split("::", 1)[0] for nodeid in candidates}
+                timeout = min(2.5, deadline - time.monotonic())
+                if len(files) <= 3 and total <= 0.8 and timeout > 0.5:
+                    started = cpu_seconds()
+                    previous_cost = cost
                     try:
                         verified = confirm(edits, candidates, all_ids, by_file, timeout)
                         workers, cost = schedule(verified, tests)
                     except (OSError, ValueError, subprocess.TimeoutExpired):
                         pass
+                    confirmation_credit += (previous_cost - cost) / 1000 - (cpu_seconds() - started)
         print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
 
 

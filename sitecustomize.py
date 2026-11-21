@@ -59,7 +59,10 @@ if owner:
         ]
         target.write_text(json.dumps((sorted(identity_sites), data)))
 
-    install(Path(root), identity_sites.add)
+    def record_lookup(key):
+        entered[owner].add(key)
+
+    install(Path(root), identity_sites.add, record_lookup)
     monitor.use_tool_id(tool, "blast-radius child reachability")
     monitor.register_callback(tool, monitor.events.PY_START, on_enter)
     monitor.register_callback(tool, monitor.events.PY_RESUME, on_enter)

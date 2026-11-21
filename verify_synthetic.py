@@ -37,12 +37,16 @@ mutations = [
 ]
 if args.scope:
     mutations = [
+        ("captured-default", "sqlglot/errors.py",
+         "ERROR_MESSAGE_CONTEXT_DEFAULT = 100", "ERROR_MESSAGE_CONTEXT_DEFAULT = 0"),
         ("module-limit", "sqlglot/typing/snowflake.py",
          "MAX_PRECISION = 38", "MAX_PRECISION = 19"),
         ("dialect-week", "sqlglot/dialects/bigquery.py",
          "WEEK_OFFSET = -1", "WEEK_OFFSET = -4"),
         ("nested-tokenizer", "sqlglot/dialects/postgres.py",
          '"u": (16, 4, 4, 0xFFFF),', '"u": (17, 4, 4, 0xFFFF),'),
+        ("enum-keyword", "sqlglot/dialects/snowflake.py",
+         '"MINUS": TokenType.EXCEPT,', '"MINUS": TokenType.PLUS,'),
         ("numeric-entry", "sqlglot/dialects/postgres.py",
          '"x": (16, 1, 2, 0xFF),', '"x": (8, 1, 2, 0xFF),'),
         ("nested-delimiter", "sqlglot/dialects/postgres.py",
