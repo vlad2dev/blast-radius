@@ -11,6 +11,7 @@ from pathlib import Path
 owner = os.environ.get("BLAST_ACTIVE_TEST")
 if owner:
     from comparison_probe import install
+    from default_probe import DefaultReads
     from receiver_probes import RECEIVER_METHODS, receivers
 
     root = os.environ["BLAST_SOURCE"]
@@ -25,7 +26,9 @@ if owner:
     monitor = sys.monitoring
     tool = monitor.COVERAGE_ID
 
-    def on_enter(code, offset):
+    defaults = DefaultReads(Path(__file__).with_name("default_sites.json"), lambda key: entered[owner].add(key))
+
+    def on_enter(code, offset, entry=True):
         if code.co_filename.startswith(prefix):
             path = code.co_filename[len(root) + 1:]
             probe = receiver_codes.get(code)
@@ -35,11 +38,17 @@ if owner:
                 monitor.set_local_events(tool, code, monitor.events.LINE)
             keys = entered[owner]
             keys.add(f"{path}:{code.co_firstlineno}")
+            complete = defaults.observe(f"{path}:{code.co_firstlineno}", code, sys._getframe(1), owner) if entry else True
             if probe:
                 for receiver in receivers(type(sys._getframe(1).f_locals["self"])):
                     keys.add(f"receiver/{receiver}")
                 return None
+            if not complete:
+                return None
         return monitor.DISABLE
+
+    def on_resume(code, offset):
+        return on_enter(code, offset, entry=False)
 
     def on_line(code, lineno):
         entered[owner].add(f"{code.co_filename[len(root) + 1:]}#{lineno}")
@@ -65,7 +74,7 @@ if owner:
     install(Path(root), identity_sites.add, record_lookup)
     monitor.use_tool_id(tool, "blast-radius child reachability")
     monitor.register_callback(tool, monitor.events.PY_START, on_enter)
-    monitor.register_callback(tool, monitor.events.PY_RESUME, on_enter)
+    monitor.register_callback(tool, monitor.events.PY_RESUME, on_resume)
     monitor.register_callback(tool, monitor.events.LINE, on_line)
     monitor.set_events(tool, monitor.events.PY_START | monitor.events.PY_RESUME)
     sys.addaudithook(on_open)
@@ -77,6 +86,7 @@ def run_pool_task(test, payload):
     if not ran_job:
         entered["@collection"].update(entered.pop(owner, ()))
         opened["@collection"].update(opened.pop(owner, ()))
+        defaults.seen.clear()
     ran_job = True
     owner = test
     os.environ["BLAST_ACTIVE_TEST"] = test

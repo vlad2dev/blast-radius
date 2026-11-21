@@ -36,7 +36,7 @@ failures = set()
 collection_errors = set()
 
 
-def on_enter(code, offset):
+def on_enter(code, offset, entry=True):
     if code.co_filename.startswith(SOURCE_PREFIX):
         path = code.co_filename[SOURCE_START :]
         probe = receiver_codes.get(code)
@@ -45,12 +45,19 @@ def on_enter(code, offset):
             receiver_codes[code] = probe
             monitor.set_local_events(tool, code, monitor.events.LINE)
         coverage[f"{path}:{code.co_firstlineno}"].add(active_test)
+        complete = defaults.observe(f"{path}:{code.co_firstlineno}", code, sys._getframe(1), active_test) if entry else True
         if probe:
             observed = receivers(type(sys._getframe(1).f_locals["self"]))
             for receiver in observed:
                 coverage[f"receiver/{receiver}"].add(active_test)
             return None
+        if not complete:
+            return None
     return sys.monitoring.DISABLE
+
+
+def on_resume(code, offset):
+    return on_enter(code, offset, entry=False)
 
 
 def on_line(code, lineno):
@@ -84,6 +91,8 @@ def on_audit(event, args):
 
 if BUILD:
     from comparison_probe import install
+    from default_probe import DefaultReads
+    defaults = DefaultReads(Path(__file__).with_name("default_sites.json"), lambda key: coverage[key].add(active_test))
     from sitecustomize import run_pool_task
 
     def record_lookup(key):
@@ -106,7 +115,7 @@ if BUILD:
     tool = monitor.COVERAGE_ID
     monitor.use_tool_id(tool, "blast-radius reachability")
     monitor.register_callback(tool, monitor.events.PY_START, on_enter)
-    monitor.register_callback(tool, monitor.events.PY_RESUME, on_enter)
+    monitor.register_callback(tool, monitor.events.PY_RESUME, on_resume)
     monitor.register_callback(tool, monitor.events.LINE, on_line)
     monitor.set_events(tool, monitor.events.PY_START | monitor.events.PY_RESUME)
     sys.addaudithook(on_audit)
@@ -234,6 +243,7 @@ def pytest_sessionfinish(session, exitstatus):
         CHILD_REPORTS.rmdir()
         owners = sorted(set().union(*coverage.values()))
         numbers = {owner: number for number, owner in enumerate(owners)}
+        data["argument_defaults"] = True
         data["owners"] = owners
         data["test_references"] = index_test_references()
         data["plain_unittest"] = sorted(plain_unittest - failures)

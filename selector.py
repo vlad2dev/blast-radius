@@ -3,6 +3,7 @@
 import ast
 import inspect
 import json
+import math
 import multiprocessing
 import os
 import re
@@ -843,8 +844,68 @@ def module_constant_candidates(path, source, updated, mapping, by_file):
     return candidates
 
 
+def default_argument_candidates(path, source, updated, mapping):
+    """Use actual entry values; explicit non-default arguments stay independent."""
+    original, patched = ast.parse(source), ast.parse(updated)
+    before = [n for n in ast.walk(original) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    after = [n for n in ast.walk(patched) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    if len(before) != len(after):
+        return None
+    parents = {child: parent for parent in ast.walk(original) for child in ast.iter_child_nodes(parent)}
+    keys = set()
+    names = set()
+    for old, new in zip(before, after):
+        if (old.name != new.name or len(old.args.defaults) != len(new.args.defaults)
+            or len(old.args.kw_defaults) != len(new.args.kw_defaults)):
+            return None
+        parameters = [*old.args.posonlyargs, *old.args.args]
+        pairs = [(old.args.defaults, new.args.defaults, parameters[len(parameters)-len(old.args.defaults):]),
+                 (old.args.kw_defaults, new.args.kw_defaults, old.args.kwonlyargs)]
+        for old_defaults, new_defaults, params in pairs:
+            for index, (left, right, parameter) in enumerate(zip(old_defaults, new_defaults, params)):
+                if same_ast(left, right):
+                    continue
+                if left is None or right is None:
+                    return None
+                try:
+                    old_value, new_value = ast.literal_eval(left), ast.literal_eval(right)
+                except (ValueError, TypeError, SyntaxError):
+                    return None
+                scalar = (type(None), bool, int, float, str)
+                if type(old_value) not in scalar or type(new_value) not in scalar:
+                    return None
+                if isinstance(old_value, float) and not math.isfinite(old_value):
+                    return None
+                if any(not isinstance(d, ast.Name) or d.id not in {"classmethod", "staticmethod"} for d in old.decorator_list):
+                    return None
+                ancestor = parents.get(old)
+                while ancestor is not None:
+                    if isinstance(ancestor, ast.ClassDef) and (ancestor.decorator_list or ancestor.keywords):
+                        return None
+                    ancestor = parents.get(ancestor)
+                first = min([old.lineno, *[d.lineno for d in old.decorator_list]])
+                keys.add(f"default/{path}:{first}/{parameter.arg}")
+                names.add(old.name)
+                old_defaults[index] = right
+    if not keys or not same_ast(original, patched):
+        return None
+    compile(updated, path, "exec")
+    owners = observed_on(mapping, keys)
+    if COLLECTION in owners:
+        return None
+    # The pinned source uses inspect.signature only to read parameter names;
+    # keep test-side metadata and reflection checks irrespective of calls.
+    names.update({"signature", "__defaults__", "__kwdefaults__", "getattr", "vars", "__dict__", "dir"})
+    owners.update(references_class(mapping, names))
+    return owners
+
+
 def signature_candidates(path, source, updated, mapping):
     """Scope literal defaults changed in otherwise identical module functions."""
+    if mapping.get("argument_defaults"):
+        precise = default_argument_candidates(path, source, updated, mapping)
+        if precise is not None:
+            return precise
     original, patched = ast.parse(source), ast.parse(updated)
     affected = []
     for old, new in zip(original.body, patched.body):
