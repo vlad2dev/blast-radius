@@ -190,8 +190,21 @@ def statement_lines(path, original, modified, removed, inserted):
     return ()
 
 
+COMPARISON_TOKEN = re.compile(rb"\bis\b|[<>]")
+
+
+def may_change_comparison(edit):
+    source, updated, removed, inserted = edit
+    return any(
+        COMPARISON_TOKEN.search(line)
+        for text, numbers in ((source, removed), (updated, inserted))
+        for index, line in enumerate(text.splitlines(), 1)
+        if index in numbers
+    )
+
+
 def safe_comparison_edit(path, source, updated, mapping):
-    """Prove the the changed comparisons agree on all observed built-in operands."""
+    """Prove the changed comparisons agree on all observed built-in operands."""
     old = ast.parse(source)
     new = ast.parse(updated)
     new_comparisons = {
@@ -226,20 +239,26 @@ def observed_on(mapping, keys):
     }
 
 
-def changed_functions(path, edit):
-    original, modified, removed, inserted = edit
-    before = FunctionBodies(original)
+@cache
+def original_function_layout(path):
+    source = (BASE / path).read_bytes()
+    visitor = FunctionBodies(source)
+    tree = visitor.visit(ast.parse(source, filename=path))
+    return visitor.functions, tree, external_code(compile(source, path, "exec"))
+
+
+def changed_functions(path, edit, updated_tree):
+    _, modified, removed, inserted = edit
+    old_functions, left, left_code = original_function_layout(path)
     after = FunctionBodies(modified)
-    left_code = external_code(compile(original, path, "exec"))
-    right_code = external_code(compile(modified, path, "exec"))
-    left = before.visit(ast.parse(original, filename=path))
-    right = after.visit(ast.parse(modified, filename=path))
+    right = after.visit(updated_tree)
     if not same_ast(left, right):
         return None
+    right_code = external_code(compile(modified, path, "exec"))
 
     affected = set()
     for (old_first, old_body, old_end), (new_first, new_body, new_end) in zip(
-        before.functions, after.functions, strict=True
+        old_functions, after.functions, strict=True
     ):
         old_lines = {line for line in removed if old_body <= line <= old_end}
         new_lines = {line for line in inserted if new_body <= line <= new_end}
@@ -368,6 +387,55 @@ def same_value_shape(old, new, tree):
     return False
 
 
+def passive_registry_value(value, tree):
+    if literal_value(value):
+        return True
+    if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
+        return resolves_enum(value.value.id, tree)
+    if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+        return (
+            closure_factory(value.func.id, tree)
+            and all(literal_value(arg) for arg in value.args)
+            and all(keyword.arg and literal_value(keyword.value) for keyword in value.keywords)
+        )
+    return False
+
+
+def named_entries(dictionary):
+    entries = {}
+    for key, value in zip(dictionary.keys, dictionary.values):
+        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+            if key.value in entries:
+                return None
+            entries[key.value] = value
+    return entries
+
+
+def pure_registry_delta(path, attribute, old, new, tree):
+    """Allow key edits to baseline per-dialect registries with passive values."""
+    dialect_table = path.startswith("sqlglot/dialects/") and attribute in {"KEYWORDS", "NUMERIC_ESCAPES"}
+    parser_table = path.startswith("sqlglot/parsers/") and attribute == "SHOW_PARSERS"
+    if not (dialect_table or parser_table) or not isinstance(old, ast.Dict) or not isinstance(new, ast.Dict):
+        return False
+    left, right = named_entries(old), named_entries(new)
+    if left is None or right is None or left.keys() == right.keys():
+        return False
+
+    changed_keys = left.keys() ^ right.keys()
+    if not all(passive_registry_value(left[key] if key in left else right[key], tree) for key in changed_keys):
+        return False
+
+    def retained(dictionary):
+        pairs = [
+            (key, value) for key, value in zip(dictionary.keys, dictionary.values)
+            if not isinstance(key, ast.Constant) or key.value not in changed_keys
+        ]
+        return ast.Dict(keys=[key for key, _ in pairs], values=[value for _, value in pairs])
+
+    # Require all other entries and dictionary expansions to be unchanged.
+    return same_ast(retained(old), retained(new))
+
+
 def class_changes(path, source, updated):
     parts = path.split("/")
     if len(parts) not in {2, 3}:
@@ -383,7 +451,10 @@ def class_changes(path, source, updated):
             if isinstance(a, ast.ClassDef) and isinstance(b, ast.ClassDef) and a.name == b.name:
                 compare_classes(a, b, f"{enclosing}.{a.name}" if enclosing else a.name)
             elif enclosing and (attribute := attribute_name(a)) and attribute == attribute_name(b):
-                if not same_ast(a.value, b.value) and same_value_shape(a.value, b.value, old):
+                if not same_ast(a.value, b.value) and (
+                    same_value_shape(a.value, b.value, old)
+                    or pure_registry_delta(path, attribute, a.value, b.value, old)
+                ):
                     changed.append((enclosing, attribute, a.value, b.value))
                     a.value = b.value
 
@@ -544,7 +615,18 @@ def value_consumers(path, attribute, old, new):
         kind = {"NUMERIC_ESCAPES": "numeric-escape", "KEYWORDS": "keyword"}.get(attribute)
     if path.startswith("sqlglot/parsers/") and attribute == "SHOW_PARSERS":
         kind = "parser-rule"
-    if kind and isinstance(old, ast.Dict) and isinstance(new, ast.Dict):
+    if kind == "keyword" and isinstance(old, ast.Dict) and isinstance(new, ast.Dict):
+        left, right = named_entries(old), named_entries(new)
+        if left is not None and right is not None and right.keys() < left.keys():
+            removed = left.keys() - right.keys()
+            # In the pinned tokenizer, ordinary words do not change the
+            # punctuation/multiword trie or the special hint and join keys.
+            if all(re.fullmatch(r"[A-Z][A-Z0-9_]*", key) for key in removed):
+                return tuple(f"keyword/{key}" for key in sorted(removed))
+    if (
+        kind and isinstance(old, ast.Dict) and isinstance(new, ast.Dict)
+        and same_ast(old.keys, new.keys)
+    ):
         # Equal key sets preserve truth, membership, and generated tries.
         # Other reads in the pinned implementation go through the instrumented
         # tokenizer or parser. Unchanged dictionary expansions may be ignored.
@@ -556,6 +638,44 @@ def value_consumers(path, attribute, old, new):
             return tuple(f"{kind}/{key.value}" for key in changed)
 
     return ()
+
+
+@cache
+def registry_dependents(path, outer, attribute):
+    """Find downstream copies even across distinct receiver hierarchies."""
+    qualified = path.removesuffix(".py").replace("/", ".")
+    pending = {(qualified, outer)}
+    seen = set()
+    while pending:
+        origin, exported = pending.pop()
+        seen.add((origin, exported))
+        for candidate, contents in project_source_files():
+            module = candidate.removesuffix(".py").replace("/", ".")
+            if module == origin or attribute.encode() not in contents or exported.encode() not in contents:
+                continue
+            tree = module_syntax(candidate)
+            aliases = {
+                name.asname or name.name
+                for statement in ast.walk(tree)
+                if isinstance(statement, ast.ImportFrom) and statement.level == 0
+                and statement.module in {origin, origin.rsplit(".", 1)[0]}
+                for name in statement.names if name.name == exported
+            }
+            if not aliases:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Attribute) or node.attr != attribute:
+                    continue
+                base = node.value
+                while isinstance(base, ast.Attribute):
+                    base = base.value
+                if isinstance(base, ast.Name) and base.id in aliases:
+                    classes = {(module, child.name) for child in tree.body if isinstance(child, ast.ClassDef)}
+                    if not classes:
+                        return None
+                    pending.update(classes - seen)
+                    break
+    return tuple(sorted(seen - {(qualified, outer)}))
 
 
 def class_candidates(path, source, updated, mapping, by_file):
@@ -570,8 +690,19 @@ def class_candidates(path, source, updated, mapping, by_file):
         roots = observed_on(mapping, {f"receiver/{module}:{name}", f"receiver/{module}:{outer}"})
         if not roots - {COLLECTION}:
             return None
+        dependents = ()
+        if attribute in {"KEYWORDS", "NUMERIC_ESCAPES", "SHOW_PARSERS"}:
+            dependents = registry_dependents(path, outer, attribute)
+            if dependents is None:
+                return None
+            for dependent, cls in dependents:
+                propagated = observed_on(mapping, (f"receiver/{dependent}:{cls}",))
+                if not propagated - {COLLECTION}:
+                    return None
+                roots.update(propagated)
+                candidates.update(references_class(mapping, {cls, attribute}))
         keys = value_consumers(path, attribute, old, new)
-        if keys and keys[0].startswith("numeric-escape/") and "numeric-origin" in mapping["dictionary_lookups"]:
+        if not dependents and keys and keys[0].startswith("numeric-escape/") and "numeric-origin" in mapping["dictionary_lookups"]:
             escapes = [key.split("/", 1)[1] for key in keys]
             keys = tuple(
                 f"numeric-origin/{origin}/{escape}"
@@ -685,8 +816,9 @@ def candidate_tests(edits, mapping, by_file, all_ids):
         elif path.startswith("sqlglot/") and path.endswith(".py"):
             source, updated, removed, inserted = edit
             owners = set(mapping["source_reads"].get(path, ()))
-            if not same_ast(ast.parse(source), ast.parse(updated)):
-                keys = changed_functions(path, edit)
+            updated_tree = ast.parse(updated, filename=path)
+            if not same_ast(module_syntax(path), updated_tree):
+                keys = changed_functions(path, edit, updated_tree)
                 if keys is None:
                     class_owners = class_candidates(path, source, updated, mapping, by_file)
                     if class_owners is None:
@@ -697,7 +829,7 @@ def candidate_tests(edits, mapping, by_file, all_ids):
                         return all_ids, ()
                     owners.update(class_owners)
                     class_modules.append(path.removesuffix(".py").replace("/", "."))
-                elif not safe_comparison_edit(path, source, updated, mapping):
+                elif not (may_change_comparison(edit) and safe_comparison_edit(path, source, updated, mapping)):
                     reached = observed_on(mapping, keys)
                     lines = statement_lines(path, source, updated, removed, inserted)
                     line_owners = observed_on(mapping, (f"{path}#{line}" for line in lines))
