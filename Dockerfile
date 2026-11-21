@@ -8,5 +8,6 @@ COPY test_observer.py sitecustomize.py receiver_probes.py comparison_probe.py /a
 RUN cd /opt/sqlglot && PYTHON_CPU_COUNT=4 OPENBLAS_NUM_THREADS=1 BLAST_COLLECT=1 BLAST_RESULT=/app/reachability.json \
     PYTHONPATH=/app:/opt/sqlglot python -m pytest -q -p no:cacheprovider \
     -p test_observer tests
+RUN python -m compileall -q --invalidation-mode checked-hash /opt/sqlglot/sqlglot
 COPY selector.py /app/selector.py
 CMD ["python", "/app/selector.py"]

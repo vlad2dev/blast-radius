@@ -16,7 +16,7 @@ from functools import cache
 from pathlib import Path, PurePosixPath
 from types import CodeType
 
-from comparison_probe import identity_site
+from comparison_probe import identity_site, order_site
 
 DATA = Path("/data")
 APP = Path(__file__).resolve().parent
@@ -166,25 +166,27 @@ def statement_lines(path, original, modified, removed, inserted):
     return ()
 
 
-def safe_identity_edit(path, source, updated, mapping):
-    """Prove the observed pure comparisons agree with identity at every changed site."""
+def safe_comparison_edit(path, source, updated, mapping):
+    """Prove the the changed comparisons agree on all observed built-in operands."""
     old = ast.parse(source)
     new = ast.parse(updated)
     new_comparisons = {
         (node.lineno, node.col_offset): node
         for node in ast.walk(new) if isinstance(node, ast.Compare)
     }
+    opposite = {
+        ast.Is: ast.Eq, ast.IsNot: ast.NotEq,
+        ast.Lt: ast.LtE, ast.LtE: ast.Lt, ast.Gt: ast.GtE, ast.GtE: ast.Gt,
+    }
     changed = False
     for node in ast.walk(old):
-        if not identity_site(node):
+        if not (identity_site(node) or order_site(node)):
             continue
         counterpart = new_comparisons.get((node.lineno, node.col_offset))
-        if counterpart is None or not isinstance(
-            counterpart.ops[0], ast.Eq if isinstance(node.ops[0], ast.Is) else ast.NotEq,
-        ):
+        if counterpart is None or not isinstance(counterpart.ops[0], opposite[type(node.ops[0])]):
             continue
-        key = f"identity/{path}:{node.lineno}:{node.col_offset}"
-        if key not in mapping["identity_only"]:
+        key = f"comparison/{path}:{node.lineno}:{node.col_offset}"
+        if key not in mapping["proven_comparisons"]:
             return False
         node.ops[0] = counterpart.ops[0]
         changed = True
@@ -316,7 +318,9 @@ def same_value_shape(old, new, tree):
 
 def class_changes(path, source, updated):
     parts = path.split("/")
-    if len(parts) != 3 or parts[1] not in {"dialects", "parsers", "generators", "expressions"}:
+    if len(parts) not in {2, 3}:
+        return ()
+    if len(parts) == 3 and parts[1] not in {"dialects", "parsers", "generators", "expressions"}:
         return ()
     old = ast.parse(source)
     new = ast.parse(updated)
@@ -328,8 +332,8 @@ def class_changes(path, source, updated):
                 compare_classes(a, b, f"{enclosing}.{a.name}" if enclosing else a.name)
             elif enclosing and (attribute := attribute_name(a)) and attribute == attribute_name(b):
                 if ast.dump(a.value) != ast.dump(b.value) and same_value_shape(a.value, b.value, old):
+                    changed.append((enclosing, attribute, a.value, b.value))
                     a.value = b.value
-                    changed.append((enclosing, attribute))
 
     compare_classes(old, new)
     if changed and ast.dump(old) == ast.dump(new):
@@ -351,7 +355,8 @@ def references_class(by_file, names):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
                 owner = node.name
             if (
-                isinstance(node, ast.Name) and node.id in names
+                isinstance(node, ast.alias) and node.name in names and node.asname is not None
+                or isinstance(node, ast.Name) and node.id in names
                 or isinstance(node, ast.Attribute) and node.attr in names
                 or isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in names
             ):
@@ -363,6 +368,56 @@ def references_class(by_file, names):
     return results
 
 
+@cache
+def scalar_consumers(attribute, bare_names=False):
+    """Find direct class-value reads; decline narrowing on an indirect reference."""
+    paths = sorted((BASE / "sqlglot").rglob("*.py"))
+    keys = set()
+    encoded = attribute.encode()
+    for path in paths:
+        if encoded not in path.read_bytes():
+            continue
+        relative = path.relative_to(BASE).as_posix()
+        for node in ast.walk(module_syntax(relative)):
+            if isinstance(node, ast.Name) and node.id == attribute and isinstance(node.ctx, ast.Load):
+                if not bare_names:
+                    return ()
+                keys.update(f"{relative}#{line}" for line in range(node.lineno, node.end_lineno + 1))
+            if isinstance(node, ast.alias) and node.name == attribute and node.asname not in (None, attribute):
+                return ()
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value == attribute:
+                return ()
+            if isinstance(node, ast.Attribute) and node.attr == attribute and isinstance(node.ctx, ast.Load):
+                keys.update(f"{relative}#{line}" for line in range(node.lineno, node.end_lineno + 1))
+    return tuple(sorted(keys))
+
+
+def scalar_literal(node):
+    return (
+        isinstance(node, ast.Constant)
+        or isinstance(node, ast.UnaryOp) and isinstance(node.operand, ast.Constant)
+    )
+
+
+def value_consumers(path, attribute, old, new):
+    if scalar_literal(old) and scalar_literal(new):
+        return scalar_consumers(attribute)
+    if (
+        path.startswith("sqlglot/dialects/") and attribute == "NUMERIC_ESCAPES"
+        and isinstance(old, ast.Dict) and isinstance(new, ast.Dict)
+    ):
+        # The pinned dialect metaclass and generator inspect key presence or
+        # truthiness, already preserved by same_value_shape. Only the tokenizer
+        # reads the dictionary values handed through its constructor.
+        tokenizer = "sqlglot/tokenizer_core.py"
+        methods = {"_read_byte_escape", "_scan_numeric_escape"}
+        return tuple(
+            f"{tokenizer}:{node.lineno}" for node in ast.walk(module_syntax(tokenizer))
+            if isinstance(node, ast.FunctionDef) and node.name in methods
+        )
+    return ()
+
+
 def class_candidates(path, source, updated, mapping, by_file):
     changes = class_changes(path, source, updated)
     if not changes:
@@ -370,13 +425,53 @@ def class_candidates(path, source, updated, mapping, by_file):
     compile(updated, path, "exec")
     module = path.removesuffix(".py").replace("/", ".")
     candidates = set()
-    for name, attribute in changes:
+    for name, attribute, old, new in changes:
         outer = name.split(".")[0]
         roots = observed_on(mapping, {f"receiver/{module}:{name}", f"receiver/{module}:{outer}"})
         if not roots - {COLLECTION}:
             return None
+        consumers = observed_on(mapping, value_consumers(path, attribute, old, new))
+        direct_reads = bool(consumers) and COLLECTION not in consumers
+        if path.count("/") == 1 and not direct_reads:
+            return None
+        if direct_reads:
+            # Expand shared setup observations before intersecting test IDs.
+            readers = set().union(*(set(by_file.get(owner, (owner,))) for owner in consumers))
+            roots = {
+                test for owner in roots - {COLLECTION}
+                for test in by_file.get(owner, (owner,))
+                if test in readers
+            }
         candidates.update(roots - {COLLECTION})
         candidates.update(references_class(by_file, {outer, attribute}))
+    return candidates
+
+
+def module_constant_candidates(path, source, updated, mapping, by_file):
+    """Narrow changes to scalar globals read directly outside collection."""
+    before = ast.parse(source)
+    after = ast.parse(updated)
+    changed = []
+    for old, new in zip(before.body, after.body):
+        name = attribute_name(old)
+        if (
+            name and name.isupper() and name == attribute_name(new)
+            and scalar_literal(old.value) and scalar_literal(new.value)
+            and ast.dump(old.value) != ast.dump(new.value)
+            and same_value_shape(old.value, new.value, before)
+        ):
+            old.value = new.value
+            changed.append(name)
+    if not changed or ast.dump(before) != ast.dump(after):
+        return None
+    compile(updated, path, "exec")
+    candidates = set()
+    for name in changed:
+        consumers = observed_on(mapping, scalar_consumers(name, bare_names=True))
+        if not consumers or COLLECTION in consumers:
+            return None
+        candidates.update(consumers)
+        candidates.update(references_class(by_file, {name}))
     return candidates
 
 
@@ -397,10 +492,12 @@ def candidate_tests(edits, mapping, by_file, all_ids):
                 if keys is None:
                     class_owners = class_candidates(path, source, updated, mapping, by_file)
                     if class_owners is None:
+                        class_owners = module_constant_candidates(path, source, updated, mapping, by_file)
+                    if class_owners is None:
                         return all_ids, ()
                     owners.update(class_owners)
                     class_modules.append(path.removesuffix(".py").replace("/", "."))
-                elif not safe_identity_edit(path, source, updated, mapping):
+                elif not safe_comparison_edit(path, source, updated, mapping):
                     reached = observed_on(mapping, keys)
                     lines = statement_lines(path, source, updated, removed, inserted)
                     line_owners = observed_on(mapping, (f"{path}#{line}" for line in lines))

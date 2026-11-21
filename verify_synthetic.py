@@ -37,10 +37,14 @@ mutations = [
 ]
 if args.scope:
     mutations = [
+        ("module-limit", "sqlglot/typing/snowflake.py",
+         "MAX_PRECISION = 38", "MAX_PRECISION = 19"),
         ("dialect-week", "sqlglot/dialects/bigquery.py",
          "WEEK_OFFSET = -1", "WEEK_OFFSET = -4"),
         ("nested-tokenizer", "sqlglot/dialects/postgres.py",
          '"u": (16, 4, 4, 0xFFFF),', '"u": (17, 4, 4, 0xFFFF),'),
+        ("numeric-entry", "sqlglot/dialects/postgres.py",
+         '"x": (16, 1, 2, 0xFF),', '"x": (8, 1, 2, 0xFF),'),
         ("nested-delimiter", "sqlglot/dialects/postgres.py",
          "        UNICODE_STRINGS = [(\"U&'\", \"'\"), (\"u&'\", \"'\")]",
          "        UNICODE_STRINGS = [(\"Q&'\", \"'\"), (\"q&'\", \"'\")]"),

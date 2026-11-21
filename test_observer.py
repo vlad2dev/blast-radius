@@ -189,7 +189,7 @@ def pytest_sessionfinish(session, exitstatus):
         data["owners"] = owners
         # This table describes observed operand semantics at source locations.
         # It contains no test identities or outcomes from patched executions.
-        data["identity_only"] = {
+        data["proven_comparisons"] = {
             key: True for key in sorted(identity_sites)
             if not key.endswith("/unproven") and key + "/unproven" not in identity_sites
         }

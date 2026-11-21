@@ -116,6 +116,35 @@ The sample and synthetic labels verify the local result. Receiver tracking
 can still miss class values propagated through unrelated global state or
 native code. The public board uses its own patches and runner.
 
+## Near-floor experiment
+
+The official score for the previous public commit was 283.8 seconds against a
+132.7-second local estimate. The ratio is 2.14. At that ratio a 60-second
+official score would correspond to about 28.1 seconds locally. The public
+sample has a 94.351-second zero-miss minimum before CPU. For each patch
+with failures, the lower bound is the minimum over worker counts of the larger
+of the longest failing test and the average failing-test load, plus worker
+overhead. A failing-tests-only schedule attains that bound for all sample
+patches. The private scoring batch can have a different minimum.
+
+The selector now intersects observed class receivers with coverage of direct
+scalar reads and the numeric escape dictionary's value consumers. It also
+handles directly read module-level scalar constants and comparison-boundary
+edits where all observed primitive operands stayed off the boundary. Patched
+imports reuse checked-hash bytecode for unchanged modules.
+
+Three scorer-constrained sample runs produced identical output with zero
+misses, 111.872 simulated seconds, median 3.118 container CPU seconds and
+median 3.828 Docker wall seconds. The estimated local score was 115.0.
+Full-suite labels for all 11 synthetic patches yielded zero misses. A
+Snowflake module constant changed from 36.817 to 3.974 simulated seconds on
+its independent patch. Candidate reruns were measured again and left
+disabled by default because the CPU cost outweighed the simulated savings.
+
+The previous official/local ratio would project roughly 246 seconds for
+this candidate. It is a one-run planning reference. An official run on the
+private scoring batch is required to determine the actual result.
+
 ## Submit
 
 Push to a public GitHub repository with the `Dockerfile` at its top, then enter the repository and the commit hash on the track page. The final scores the commit you pick. If you pick none, your best practice submission counts.

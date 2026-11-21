@@ -3,6 +3,7 @@
 import ast
 import builtins
 import importlib.machinery
+import operator
 
 PROBE = "_blast_observe_identity"
 
@@ -16,6 +17,34 @@ def identity_site(node):
         and isinstance(node.left, ast.Attribute)
         and (isinstance(right, ast.Attribute) or (isinstance(right, ast.Constant) and right.value is None))
     )
+
+
+ORDER_OPERATORS = {
+    ast.Lt: operator.lt, ast.LtE: operator.le, ast.Gt: operator.gt, ast.GtE: operator.ge,
+}
+
+
+def order_site(node):
+    return (
+        isinstance(node, ast.Compare) and len(node.ops) == 1
+        and type(node.ops[0]) in ORDER_OPERATORS
+        and isinstance(node.left, (ast.Attribute, ast.Name))
+        and isinstance(node.comparators[0], (ast.Constant, ast.Tuple))
+    )
+
+
+def proven_order(left, right):
+    if type(left) is not type(right):
+        return False
+    if type(left) in (int, float, str):
+        return left != right
+    if type(left) is tuple:
+        return (
+            all(type(item) is int for item in left)
+            and all(type(item) is int for item in right)
+            and left != right
+        )
+    return False
 
 
 def default_comparison(value):
@@ -44,11 +73,17 @@ def install(root, record):
     source_root = str(root) + "/sqlglot/"
     original_loader = importlib.machinery.SourceFileLoader.get_code
 
-    def observe(key, left, right, negated):
+    order = {kind.__name__: compare for kind, compare in ORDER_OPERATORS.items()}
+
+    def observe(key, left, right, operation):
+        record(key)
+        if operation in order:
+            if not proven_order(left, right):
+                record(key + "/unproven")
+            return order[operation](left, right)
         if not comparison_agrees_with_identity(left, right):
             record(key + "/unproven")
-        record(key)
-        return (left is not right) if negated else (left is right)
+        return (left is not right) if operation == "IsNot" else (left is right)
 
     setattr(builtins, PROBE, observe)
 
@@ -59,16 +94,16 @@ def install(root, record):
 
         def visit_Compare(self, node):
             node = self.generic_visit(node)
-            if not identity_site(node):
+            if not (identity_site(node) or order_site(node)):
                 return node
             self.changed = True
-            key = f"identity/{self.path}:{node.lineno}:{node.col_offset}"
+            key = f"comparison/{self.path}:{node.lineno}:{node.col_offset}"
             return ast.copy_location(
                 ast.Call(
                     func=ast.Name(id=PROBE, ctx=ast.Load()),
                     args=[
                         ast.Constant(key), node.left, node.comparators[0],
-                        ast.Constant(isinstance(node.ops[0], ast.IsNot)),
+                        ast.Constant(type(node.ops[0]).__name__),
                     ],
                     keywords=[],
                 ),
@@ -79,7 +114,7 @@ def install(root, record):
         filename = loader.get_filename(fullname)
         if filename.startswith(source_root):
             source = loader.get_data(filename)
-            if b" is " in source:
+            if any(token in source for token in (b" is ", b"<", b">")):
                 transform = Observe(filename[len(str(root)) + 1 :])
                 tree = transform.visit(ast.parse(source, filename=filename))
                 if transform.changed:
